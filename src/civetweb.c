@@ -2438,8 +2438,6 @@ static int alloc_vprintf(char **buf, size_t size, const char *fmt, va_list ap)
     return len;
 }
 
-int mg_vprintf(struct mg_connection *conn, const char *fmt, va_list ap);
-
 int mg_vprintf(struct mg_connection *conn, const char *fmt, va_list ap)
 {
     char mem[MG_BUF_LEN], *buf = mem;
@@ -5471,7 +5469,7 @@ static uint32_t get_remote_ip(const struct mg_connection *conn)
 int mg_upload(struct mg_connection *conn, const char *destination_dir)
 {
     const char *content_type_header, *boundary_start;
-    char buf[MG_BUF_LEN], path[PATH_MAX], fname[1024], boundary[100], *s;
+    char buf[MG_BUF_LEN], path[PATH_MAX], tmp_path[PATH_MAX], fname[1024], boundary[100], *s;
     FILE *fp;
     int bl, n, i, j, headers_len, boundary_len, eof,
         len = 0, num_uploaded_files = 0;
@@ -5551,8 +5549,10 @@ int mg_upload(struct mg_connection *conn, const char *destination_dir)
         }
 
         /* Open file in binary mode. TODO: set an exclusive lock. */
-        snprintf(path, sizeof(path), "%s/%s", destination_dir, s);
-        if ((fp = fopen(path, "wb")) == NULL) {
+        snprintf(path, sizeof(path)-1, "%s/%s", destination_dir, s);
+        strcpy(tmp_path, path);
+        strcat(tmp_path, "~");
+        if ((fp = fopen(tmp_path, "wb")) == NULL) {
             break;
         }
 
@@ -5579,10 +5579,14 @@ int mg_upload(struct mg_connection *conn, const char *destination_dir)
         } while (!eof && (n = mg_read(conn, buf + len, sizeof(buf) - len)) > 0);
         fclose(fp);
         if (eof) {
+            remove(path);
+            rename(tmp_path, path);
             num_uploaded_files++;
             if (conn->ctx->callbacks.upload != NULL) {
                 conn->ctx->callbacks.upload(conn, path);
             }
+        } else {
+            remove(tmp_path);
         }
     }
 
@@ -6420,7 +6424,7 @@ void mg_close_connection(struct mg_connection *conn)
     mg_free(conn);
 }
 
-static struct mg_connection *mg_connect(const char *host, int port, int use_ssl,
+struct mg_connection *mg_connect_client(const char *host, int port, int use_ssl,
                                  char *ebuf, size_t ebuf_len)
 {
     static struct mg_context fake_ctx;
@@ -6515,6 +6519,12 @@ static int getreq(struct mg_connection *conn, char *ebuf, size_t ebuf_len)
     return ebuf[0] == '\0';
 }
 
+int mg_get_response(struct mg_connection *conn, char *ebuf, size_t ebuf_len)
+{
+    /* Implementation of API function for HTTP clients */
+    return getreq(conn, ebuf, ebuf_len);
+}
+
 struct mg_connection *mg_download(const char *host, int port, int use_ssl,
                                   char *ebuf, size_t ebuf_len,
                                   const char *fmt, ...)
@@ -6524,7 +6534,7 @@ struct mg_connection *mg_download(const char *host, int port, int use_ssl,
 
     va_start(ap, fmt);
     ebuf[0] = '\0';
-    if ((conn = mg_connect(host, port, use_ssl, ebuf, ebuf_len)) == NULL) {
+    if ((conn = mg_connect_client(host, port, use_ssl, ebuf, ebuf_len)) == NULL) {
     } else if (mg_vprintf(conn, fmt, ap) <= 0) {
         snprintf(ebuf, ebuf_len, "%s", "Error sending request");
     } else {
