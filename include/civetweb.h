@@ -331,6 +331,9 @@ CIVETWEB_API struct mg_request_info *mg_get_request_info(struct mg_connection *)
     >0  number of bytes written on success */
 CIVETWEB_API int mg_write(struct mg_connection *, const void *buf, size_t len);
 
+/* Finish with client */
+CIVETWEB_API void mg_finish(struct mg_connection *);
+
 
 /* Send data to a websocket client wrapped in a websocket frame.  Uses mg_lock
    to ensure that the transmission is not interrupted, i.e., when the

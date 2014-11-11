@@ -6379,7 +6379,7 @@ static void close_connection(struct mg_connection *conn)
 #endif
 
     /* call the connection_close callback if assigned */
-    if ((conn->ctx->callbacks.connection_close != NULL) && (conn->ctx->context_type == 1)) {
+    if ((conn->client.sock != INVALID_SOCKET) && (conn->ctx->callbacks.connection_close != NULL) && (conn->ctx->context_type == 1)) {
         conn->ctx->callbacks.connection_close(conn);
     }
 
@@ -6405,6 +6405,11 @@ static void close_connection(struct mg_connection *conn)
 #if defined(USE_WEBSOCKET)
     mg_unlock_connection(conn);
 #endif
+}
+
+void mg_finish(struct mg_connection *conn)
+{
+    close_connection(conn);
 }
 
 void mg_close_connection(struct mg_connection *conn)
