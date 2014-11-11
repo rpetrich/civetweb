@@ -837,7 +837,9 @@ struct mg_connection {
     int throttle;                   /* Throttling, bytes/sec. <= 0 means no throttle */
     time_t last_throttle_time;      /* Last time throttled data was sent */
     int64_t last_throttle_bytes;    /* Bytes sent this second */
+#if defined(USE_WEBSOCKET)
     pthread_mutex_t mutex;          /* Used by mg_lock_connection/mg_unlock_connection to ensure atomic transmissions for websockets */
+#endif
 #if defined(USE_LUA) && defined(USE_WEBSOCKET)
     void * lua_websocket_state;     /* Lua_State for a websocket connection */
 #endif
@@ -4912,6 +4914,7 @@ static void handle_propfind(struct mg_connection *conn, const char *path,
     conn->num_bytes_sent += mg_printf(conn, "%s\n", "</d:multistatus>");
 }
 
+#if defined(USE_WEBSOCKET)
 void mg_lock_connection(struct mg_connection* conn)
 {
     (void) pthread_mutex_lock(&conn->mutex);
@@ -4921,6 +4924,7 @@ void mg_unlock_connection(struct mg_connection* conn)
 {
     (void) pthread_mutex_unlock(&conn->mutex);
 }
+#endif
 
 void mg_lock_context(struct mg_context* ctx)
 {
@@ -5340,10 +5344,14 @@ int mg_websocket_write(struct mg_connection* conn, int opcode, const char* data,
        but mongoose's mg_printf/mg_write is not (because of the loop in
        push(), although that is only a problem if the packet is large or
        outgoing buffer is full). */
+#if defined(USE_WEBSOCKET)
     (void) mg_lock_connection(conn);
+#endif
     retval = mg_write(conn, header, headerLen);
     retval = mg_write(conn, data, dataLen);
+#if defined(USE_WEBSOCKET)
     mg_unlock_connection(conn);
+#endif
 
     return retval;
 }
@@ -6375,7 +6383,9 @@ static void close_connection(struct mg_connection *conn)
         conn->ctx->callbacks.connection_close(conn);
     }
 
+#if defined(USE_WEBSOCKET)
     mg_lock_connection(conn);
+#endif
 
     conn->must_close = 1;
 
@@ -6392,7 +6402,9 @@ static void close_connection(struct mg_connection *conn)
         conn->client.sock = INVALID_SOCKET;
     }
 
+#if defined(USE_WEBSOCKET)
     mg_unlock_connection(conn);
+#endif
 }
 
 void mg_close_connection(struct mg_connection *conn)
@@ -6420,7 +6432,9 @@ void mg_close_connection(struct mg_connection *conn)
         mg_free(client_ctx->workerthreadids);
         mg_free(client_ctx);
     }
+#if defined(USE_WEBSOCKET)
     (void) pthread_mutex_destroy(&conn->mutex);
+#endif
     mg_free(conn);
 }
 
@@ -6456,7 +6470,9 @@ struct mg_connection *mg_connect_client(const char *host, int port, int use_ssl,
                    __func__, strerror(ERRNO));
         }
         conn->client.is_ssl = use_ssl;
+#if defined(USE_WEBSOCKET)
         (void) pthread_mutex_init(&conn->mutex, NULL);
+#endif
 #ifndef NO_SSL
         if (use_ssl) {
             /* SSL_CTX_set_verify call is needed to switch off server
@@ -6759,7 +6775,9 @@ static void *worker_thread_run(void *thread_func_param)
         conn->request_info.user_data = ctx->user_data;
         /* Allocate a mutex for this connection to allow communication both
            within the request handler and from elsewhere in the application */
+#if defined(USE_WEBSOCKET)
         (void) pthread_mutex_init(&conn->mutex, NULL);
+#endif
 
         /* Call consume_socket() even when ctx->stop_flag > 0, to let it
            signal sq_empty condvar to wake up the master waiting in

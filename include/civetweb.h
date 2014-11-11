@@ -353,12 +353,14 @@ CIVETWEB_API int mg_websocket_write(struct mg_connection* conn, int opcode,
    Invoke this before mg_write or mg_printf when communicating with a
    websocket if your code has server-initiated communication as well as
    communication in direct response to a message. */
+#if defined(USE_WEBSOCKET)
 CIVETWEB_API void mg_lock_connection(struct mg_connection* conn);
 CIVETWEB_API void mg_unlock_connection(struct mg_connection* conn);
 
 #if defined(MG_LEGACY_INTERFACE)
 #define mg_lock mg_lock_connection
 #define mg_unlock mg_unlock_connection
+#endif
 #endif
 
 /* Lock server context.  This lock may be used to protect ressources
