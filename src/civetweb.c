@@ -5748,10 +5748,6 @@ static void handle_request(struct mg_connection *conn)
     }
     remove_double_dots_and_double_slashes((char *) ri->uri);
     path[0] = '\0';
-    interpret_uri(conn, path, sizeof(path), &file, &is_script_resource, &is_websocket_request, &is_put_or_delete_request);
-    conn->throttle = set_throttle(conn->ctx->config[THROTTLE],
-                                  get_remote_ip(conn), ri->uri);
-
     DEBUG_TRACE("%s", ri->uri);
     /* Perform redirect and auth checks before calling begin_request() handler.
        Otherwise, begin_request() would need to perform auth checks and
@@ -5759,12 +5755,19 @@ static void handle_request(struct mg_connection *conn)
     if (!conn->client.is_ssl && conn->client.ssl_redir &&
         (ssl_index = get_first_ssl_listener_index(conn->ctx)) > -1) {
         redirect_to_https_port(conn, ssl_index);
-    } else if (!is_script_resource && !is_put_or_delete_request &&
-               !check_authorization(conn, path)) {
-        send_authorization_request(conn);
+        return;
     } else if (conn->ctx->callbacks.begin_request != NULL &&
                conn->ctx->callbacks.begin_request(conn)) {
         /* Do nothing, callback has served the request */
+        return;
+    }
+
+    interpret_uri(conn, path, sizeof(path), &file, &is_script_resource, &is_websocket_request, &is_put_or_delete_request);
+    conn->throttle = set_throttle(conn->ctx->config[THROTTLE],
+                                  get_remote_ip(conn), ri->uri);
+    if (!is_script_resource && !is_put_or_delete_request &&
+               !check_authorization(conn, path)) {
+        send_authorization_request(conn);
 #if defined(USE_WEBSOCKET)
     } else if (is_websocket_request) {
         handle_websocket_request(conn, path, is_script_resource);
