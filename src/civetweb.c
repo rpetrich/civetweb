@@ -1897,11 +1897,13 @@ static int poll(struct pollfd *pfd, int n, int milliseconds)
 }
 #endif /* HAVE_POLL */
 
+#if !defined(CIVET_NO_CLOEXEC)
 static void set_close_on_exec(SOCKET sock, struct mg_connection *conn /* may be null */)
 {
     (void) conn; /* Unused. */
     (void) SetHandleInformation((HANDLE) sock, HANDLE_FLAG_INHERIT, 0);
 }
+#endif
 
 int mg_start_thread(mg_thread_func_t f, void *p)
 {
@@ -2092,6 +2094,7 @@ static int mg_stat(struct mg_connection *conn, const char *path,
     return filep->membuf != NULL || filep->modification_time != (time_t) 0;
 }
 
+#if !defined(CIVET_NO_CLOEXEC)
 static void set_close_on_exec(int fd, struct mg_connection *conn /* may be null */)
 {
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
@@ -2100,6 +2103,7 @@ static void set_close_on_exec(int fd, struct mg_connection *conn /* may be null 
         }
     }
 }
+#endif
 
 int mg_start_thread(mg_thread_func_t func, void *param)
 {
@@ -3493,7 +3497,9 @@ static SOCKET conn2(struct mg_context *ctx  /* may be null */, const char *host,
     } else if ((sock = socket(PF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
         snprintf(ebuf, ebuf_len, "socket(): %s", strerror(ERRNO));
     } else {
+#if !defined(CIVET_NO_CLOEXEC)
         set_close_on_exec(sock, fc(ctx));
+#endif
         memset(&sain, '\0', sizeof(sain));
         sain.sin_family = AF_INET;
         sain.sin_port = htons((uint16_t) port);
@@ -4392,10 +4398,12 @@ static void handle_cgi_request(struct mg_connection *conn, const char *prog)
     }
 
     /* Make sure child closes all pipe descriptors. It must dup them to 0,1 */
+#if !defined(CIVET_NO_CLOEXEC)
     set_close_on_exec(fdin[0], conn);
     set_close_on_exec(fdin[1], conn);
     set_close_on_exec(fdout[0], conn);
     set_close_on_exec(fdout[1], conn);
+#endif
 
     /* Parent closes only one side of the pipes.
        If we don't mark them as closed, close() attempt before
@@ -6005,7 +6013,9 @@ static int set_ports_option(struct mg_context *ctx)
             success = 0;
         }
         else {
+#if !defined(CIVET_NO_CLOEXEC)
             set_close_on_exec(so.sock, fc(ctx));
+#endif
             ctx->listening_sockets = ptr;
             ctx->listening_sockets[ctx->num_listening_sockets] = so;
             ctx->listening_ports = portPtr;
@@ -6900,7 +6910,9 @@ static void accept_new_connection(const struct socket *listener,
     } else {
         /* Put so socket structure into the queue */
         DEBUG_TRACE("Accepted socket %d", (int) so.sock);
+#if !defined(CIVET_NO_CLOEXEC)
         set_close_on_exec(so.sock, fc(ctx));
+#endif
         so.is_ssl = listener->is_ssl;
         so.ssl_redir = listener->ssl_redir;
         if (getsockname(so.sock, &so.lsa.sa, &len) != 0) {
@@ -6919,7 +6931,9 @@ static void accept_new_connection(const struct socket *listener,
                    "%s: setsockopt(SOL_SOCKET SO_KEEPALIVE) failed: %s",
                    __func__, strerror(ERRNO));
         }
-        set_sock_timeout(so.sock, ctx->timeout);
+        if (ctx->timeout != -1) {
+            set_sock_timeout(so.sock, ctx->timeout);
+        }
         produce_socket(ctx, &so);
     }
 }
