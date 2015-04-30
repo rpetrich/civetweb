@@ -2215,7 +2215,11 @@ static int set_non_blocking_mode(SOCKET sock)
 {
     int flags;
 
+#if defined(CIVET_NONBLOCK_ORIG_FL)
+    flags = CIVET_NONBLOCK_ORIG_FL;
+#else
     flags = fcntl(sock, F_GETFL, 0);
+#endif
     (void) fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
     return 0;
