@@ -776,6 +776,7 @@ struct mg_context {
     volatile int stop_flag;         /* Should we stop event loop */
     SSL_CTX *ssl_ctx;               /* SSL context */
     char *config[NUM_OPTIONS];      /* Civetweb configuration parameters */
+    int timeout;
     struct mg_callbacks callbacks;  /* User-defined callback function */
     void *user_data;                /* User-defined data */
     int context_type;               /* 1 = server context, 2 = client context */
@@ -6918,7 +6919,7 @@ static void accept_new_connection(const struct socket *listener,
                    "%s: setsockopt(SOL_SOCKET SO_KEEPALIVE) failed: %s",
                    __func__, strerror(ERRNO));
         }
-        set_sock_timeout(so.sock, atoi(ctx->config[REQUEST_TIMEOUT]));
+        set_sock_timeout(so.sock, ctx->timeout);
         produce_socket(ctx, &so);
     }
 }
@@ -7237,6 +7238,7 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
             ctx->config[i] = mg_strdup(default_value);
         }
     }
+    ctx->timeout = atoi(ctx->config[REQUEST_TIMEOUT]);
 
     get_system_name(&ctx->systemName);
 
