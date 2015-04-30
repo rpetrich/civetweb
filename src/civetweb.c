@@ -6364,8 +6364,10 @@ static void close_socket_gracefully(struct mg_connection *conn)
     }
 
     /* Send FIN to the client */
+#if !defined(CIVET_QUICK_SHUTDOWN)
     shutdown(conn->client.sock, SHUT_WR);
     set_non_blocking_mode(conn->client.sock);
+#endif
 
 #if defined(_WIN32)
     /* Read and discard pending incoming data. If we do not do that and close
