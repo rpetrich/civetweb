@@ -2071,11 +2071,13 @@ static pid_t spawn_process(struct mg_connection *conn, const char *prog,
 }
 #endif /* !NO_CGI */
 
+#if !defined(CIVET_QUICK_SHUTDOWN)
 static int set_non_blocking_mode(SOCKET sock)
 {
     unsigned long on = 1;
     return ioctlsocket(sock, FIONBIO, &on);
 }
+#endif
 
 #else
 static int mg_stat(struct mg_connection *conn, const char *path,
@@ -2211,6 +2213,7 @@ static pid_t spawn_process(struct mg_connection *conn, const char *prog,
 }
 #endif /* !NO_CGI */
 
+#if !defined(CIVET_QUICK_SHUTDOWN)
 static int set_non_blocking_mode(SOCKET sock)
 {
     int flags;
@@ -2224,6 +2227,7 @@ static int set_non_blocking_mode(SOCKET sock)
 
     return 0;
 }
+#endif
 #endif /* _WIN32 */
 
 /* Write data to the IO channel - opened file descriptor, socket or SSL
