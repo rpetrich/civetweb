@@ -19,6 +19,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #if defined(_WIN32)
 #if !defined(_CRT_SECURE_NO_WARNINGS)
@@ -7339,3 +7341,5 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
 
     return ctx;
 }
+
+#pragma GCC diagnostic pop
