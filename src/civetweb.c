@@ -91,6 +91,14 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#ifdef __linux__
+#if !defined(CIVET_NO_EPOLL)
+#include <sys/epoll.h>
+#endif
+#else
+#define CIVET_NO_EPOLL
+#endif
+
 #ifndef MAX_WORKER_THREADS
 #define MAX_WORKER_THREADS 1024
 #endif
@@ -816,6 +824,9 @@ struct mg_context {
 
 #ifdef USE_TIMERS
     struct timers * timers;
+#endif
+#if !defined(CIVET_NO_EPOLL)
+    int epoll_fd;
 #endif
 };
 
@@ -6357,22 +6368,40 @@ static void close_socket_gracefully(struct mg_connection *conn)
     char buf[MG_BUF_LEN];
     int n;
 #endif
+    int socket_fd = conn->client.sock;
+#if !defined(CIVET_NO_LINGER)
     struct linger linger;
 
     /* Set linger option to avoid socket hanging out after close. This prevent
        ephemeral port exhaust problem under high QPS. */
     linger.l_onoff = 1;
     linger.l_linger = 1;
-    if (setsockopt(conn->client.sock, SOL_SOCKET, SO_LINGER,
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_LINGER,
                    (char *) &linger, sizeof(linger)) != 0) {
         mg_cry(conn, "%s: setsockopt(SOL_SOCKET SO_LINGER) failed: %s",
                __func__, strerror(ERRNO));
     }
+#endif
+
+#if !defined(CIVET_NO_EPOLL)
+    int epoll_fd = conn->ctx->epoll_fd;
+    if (epoll_fd != -1) {
+        struct epoll_event event;
+        event.events = EPOLLONESHOT | EPOLLERR;
+        event.data.fd = socket_fd;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &event) != -1) {
+            shutdown(socket_fd, SHUT_WR);
+            conn->client.sock = INVALID_SOCKET;
+            return;
+        }
+    }
+#endif
+    conn->client.sock = INVALID_SOCKET;
 
     /* Send FIN to the client */
 #if !defined(CIVET_QUICK_SHUTDOWN)
-    shutdown(conn->client.sock, SHUT_WR);
-    set_non_blocking_mode(conn->client.sock);
+    shutdown(socket_fd, SHUT_WR);
+    set_non_blocking_mode(socket_fd);
 #endif
 
 #if defined(_WIN32)
@@ -6387,8 +6416,7 @@ static void close_socket_gracefully(struct mg_connection *conn)
 #endif
 
     /* Now we know that our FIN is ACK-ed, safe to close */
-    closesocket(conn->client.sock);
-    conn->client.sock = INVALID_SOCKET;
+    closesocket(socket_fd);
 }
 
 static void close_connection(struct mg_connection *conn)
@@ -6950,11 +6978,69 @@ static void accept_new_connection(const struct socket *listener,
     }
 }
 
+static void poll_for_connections(struct mg_context *ctx)
+{
+    int i;
+    /* Use epoll on linux */
+#if !defined(CIVET_NO_EPOLL)
+    int count;
+    struct epoll_event events[16];
+    int epoll_fd = ctx->epoll_fd;
+    if (epoll_fd != -1) {
+        for (;;) {
+            count = epoll_wait(epoll_fd, events, sizeof(events) / sizeof(events[0]), 200);
+            if (ctx->stop_flag == 1) {
+                break;
+            }
+            if (count == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            for (i = 0; i < count; i++) {
+                if (events[i].events & EPOLLIN) {
+                    accept_new_connection(events[i].data.ptr, ctx);
+                }
+                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+                    // Close file descriptors that have hung up or have an error
+                    int dead_fd = events[i].data.fd;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, dead_fd, &events[i]);
+                    closesocket(dead_fd);
+                }
+            }
+        }
+        return;
+    }
+#endif
+    /* Allocate memory for the listening sockets, and start the server */
+    struct pollfd *pfd = (struct pollfd *) mg_calloc(ctx->num_listening_sockets, sizeof(pfd[0]));
+    while (pfd != NULL && ctx->stop_flag == 0) {
+        for (i = 0; i < ctx->num_listening_sockets; i++) {
+            pfd[i].fd = ctx->listening_sockets[i].sock;
+            pfd[i].events = POLLIN;
+        }
+
+        if (poll(pfd, ctx->num_listening_sockets, 200) > 0) {
+            for (i = 0; i < ctx->num_listening_sockets; i++) {
+                /* NOTE(lsm): on QNX, poll() returns POLLRDNORM after the
+                   successful poll, and POLLIN is defined as
+                   (POLLRDNORM | POLLRDBAND)
+                   Therefore, we're checking pfd[i].revents & POLLIN, not
+                   pfd[i].revents == POLLIN. */
+                if (ctx->stop_flag == 0 && (pfd[i].revents & POLLIN)) {
+                    accept_new_connection(&ctx->listening_sockets[i], ctx);
+                }
+            }
+        }
+    }
+    mg_free(pfd);
+}
+
 static void master_thread_run(void *thread_func_param)
 {
     struct mg_context *ctx = (struct mg_context *) thread_func_param;
     struct mg_workerTLS tls;
-    struct pollfd *pfd;
     int i;
     int workerthreadcount;
 
@@ -6984,28 +7070,26 @@ static void master_thread_run(void *thread_func_param)
     /* Server starts *now* */
     ctx->start_time = (unsigned long)time(NULL);
 
-    /* Allocate memory for the listening sockets, and start the server */
-    pfd = (struct pollfd *) mg_calloc(ctx->num_listening_sockets, sizeof(pfd[0]));
-    while (pfd != NULL && ctx->stop_flag == 0) {
+    /* Setup epoll, if available */
+#if !defined(CIVET_NO_EPOLL)
+    ctx->epoll_fd = epoll_create(ctx->num_listening_sockets);
+    if (ctx->epoll_fd != -1) {
+        struct epoll_event event;
         for (i = 0; i < ctx->num_listening_sockets; i++) {
-            pfd[i].fd = ctx->listening_sockets[i].sock;
-            pfd[i].events = POLLIN;
-        }
-
-        if (poll(pfd, ctx->num_listening_sockets, 200) > 0) {
-            for (i = 0; i < ctx->num_listening_sockets; i++) {
-                /* NOTE(lsm): on QNX, poll() returns POLLRDNORM after the
-                   successful poll, and POLLIN is defined as
-                   (POLLRDNORM | POLLRDBAND)
-                   Therefore, we're checking pfd[i].revents & POLLIN, not
-                   pfd[i].revents == POLLIN. */
-                if (ctx->stop_flag == 0 && (pfd[i].revents & POLLIN)) {
-                    accept_new_connection(&ctx->listening_sockets[i], ctx);
-                }
+            event.events = EPOLLIN;
+            event.data.ptr = &ctx->listening_sockets[i];
+            if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->listening_sockets[i].sock, &event) == -1) {
+                // Fallback to polling
+                close(ctx->epoll_fd);
+                ctx->epoll_fd = -1;
+                break;
             }
         }
     }
-    mg_free(pfd);
+#endif
+
+    /* Accept connections */
+    poll_for_connections(ctx);
     DEBUG_TRACE("stopping workers");
 
     /* Stop signal received: somebody called mg_stop. Quit. */
@@ -7026,6 +7110,12 @@ static void master_thread_run(void *thread_func_param)
     for (i = 0; i < workerthreadcount; i++) {
         mg_join_thread(ctx->workerthreadids[i]);
     }
+
+#if !defined(CIVET_NO_EPOLL)
+    if (ctx->epoll_fd != -1) {
+        close(ctx->epoll_fd);
+    }
+#endif
 
 #if !defined(NO_SSL)
     if (ctx->ssl_ctx != NULL) {
