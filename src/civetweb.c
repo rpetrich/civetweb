@@ -7004,9 +7004,8 @@ static void poll_for_connections(struct mg_context *ctx)
                 }
                 if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                     // Close file descriptors that have hung up or have an error
-                    int dead_fd = events[i].data.fd;
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, dead_fd, &events[i]);
-                    closesocket(dead_fd);
+                    // Will be automatically removed from the epool file descriptor
+                    closesocket(events[i].data.fd);
                 }
             }
         }
