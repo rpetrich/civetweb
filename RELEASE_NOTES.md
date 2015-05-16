@@ -1,25 +1,39 @@
 Release Notes v1.7 (Under Development)
 ===
-### Objectives: *???*
+### Objectives: *Examples, documentation, additional API functions, rewritten handle_request method, bug fixes and updates*
 
 Changes
 -------
 
+- URI specific callbacks for websockets
+- Add chunked transfer support (TODO: currently not working)
+- Update LuaFileSystem
+- Update Lua to 5.2.4
+- Fix build for MinGW-x64, TDM-GCC and clang
+- Update SQLite to 3.8.8.3
+- Fix CGI variables SCRIPT_NAME and PATH_TRANSLATED
+- Set TCP_USER_TIMEOUT to deal faster with broken connections
+- Add a Lua form handling example
+- Return more differentiated HTTP error codes
+- Add log_access callback
+- Rewrite and comment request handling function
+- Specify in detail and document return values of callback functions
+- Set names for all threads (unless NO_THREAD_NAME is defined)
 - New API functions for TCP/HTTP clients
 - Fix upload of huge files
 - Allow multiple SSL instances within one application
-- Improve API and user docu
-- Allow to chose betwen static and dynamic Lua library
+- Improve API and user documentation
+- Allow to choose between static and dynamic Lua library
 - Improve unit test
 - Use temporary file name for partially uploaded files
-- Addtional API functions exported to C++
+- Additional API functions exported to C++
 - Add a websocket client example
 - Add a websocket client API
 - Update websocket example
 - Make content length available in request_info
 - New API functions: access context, callback for create/delete, access user data
-- Upgraded Lua from 5.2.2 to 5.2.3
-- Integrate LuaXML
+- Upgraded Lua from 5.2.2 to 5.2.3 and finally 5.2.4
+- Integrate LuaXML (for testing purposes)
 - Fix compiler warnings
 - Updated version number
 

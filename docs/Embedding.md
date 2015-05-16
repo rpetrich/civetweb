@@ -10,7 +10,7 @@ There is just a small set of files to compile in to the application,
 but if a library is desired, see [Building.md](https://github.com/bel2125/civetweb/blob/master/docs/Building.md)
 
 #### Regarding the INL file extension
-The *INL* file extension represents code that is statically included inline in a source file.  Slightly different from C++ where it means "inline" code which is technically not the same as static code. Civetweb overloads this extension for the sake of clearity as opossed to having .c extensions on files that should not be directly compiled.
+The *INL* file extension represents code that is statically included inline in a source file.  Slightly different from C++ where it means "inline" code which is technically not the same as static code. Civetweb overloads this extension for the sake of clarity as opposed to having .c extensions on files that should not be directly compiled.
 
 #### Required Files
 
@@ -44,7 +44,7 @@ By default, the server will automatically serve up files like a normal HTTP serv
 
 ### C++
   - Create CivetHandlers for each URI.
-  - Register the handlers with ```CivertServer::addHandler()```
+  - Register the handlers with ```CivetServer::addHandler()```
   - ```CivetServer``` starts on contruction and stops on destruction.
   - Use contructor *options* to select the port and document root among other things.
   - Use constructor *callbacks* to add your own hooks.
@@ -52,7 +52,7 @@ By default, the server will automatically serve up files like a normal HTTP serv
 Lua Support
 ------
 
-Lua is a server side include functionality.  Files ending in .la will be processed with Lua.
+Lua is a server side include functionality.  Files ending in .lua will be processed with Lua.
 
 ##### Add the following CFLAGS
 
@@ -64,7 +64,7 @@ Lua is a server side include functionality.  Files ending in .la will be process
 ##### Add the following sources
 
   - src/mod_lua.inl
-  - src/third_party/lua-5.2.3/src
+  - src/third_party/lua-5.2.4/src
      + lapi.c
      + lauxlib.c
      + lbaselib.c
@@ -125,6 +125,10 @@ two threads: a master thread, that accepts new connections, and several
 worker threads, that process accepted connections. The number of worker threads
 is configurable via `num_threads` configuration option. That number puts a
 limit on number of simultaneous requests that can be handled by civetweb.
+If you embed civetweb into a program that uses SSL outside civetweb as well,
+you may need to initialize SSL before calling `mg_start()`, and set the pre-
+processor define SSL_ALREADY_INITIALIZED. This is not required if SSL is used
+only within civetweb.
 
 When master thread accepts new connection, a new accepted socket (described by
 `struct socket`) it placed into the accepted sockets queue,

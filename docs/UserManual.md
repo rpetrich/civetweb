@@ -279,7 +279,7 @@ For example, to bind to a loopback interface on port 80 and to
 all interfaces on HTTPS port 443, use `127.0.0.1:80,443s`.
 
 ### document\_root `.`
-A directory to serve. By default, the current workubg directory is served.
+A directory to serve. By default, the current working directory is served.
 The current directory is commonly referenced as dot (`.`).
 
 ### ssl\_certificate
@@ -408,7 +408,7 @@ page, one can write:
     </p>
 
 Lua is known for it's speed and small size. Civetweb currently uses Lua
-version 5.2.3. The documentation for it can be found in the
+version 5.2.4. The documentation for it can be found in the
 [Lua 5.2 reference manual](http://www.lua.org/manual/5.2/).
 
 
@@ -416,7 +416,10 @@ Note that this example uses function `mg.write()`, which sends data to the
 web client. Using `mg.write()` is the way to generate web content from inside
 Lua code. In addition to `mg.write()`, all standard Lua library functions
 are accessible from the Lua code (please check the reference manual for
-details). Information on the request is available in the `mg.request_info`
+details). Lua functions working on files (e.g., `io.open`) use a path
+relative to the working path of the civetweb process. The web server content
+is located in the path `mg.document_root`.
+Information on the request is available in the `mg.request_info`
 object, like the request method, all HTTP headers, etcetera.
 
 [page2.lua](https://github.com/bel2125/civetweb/blob/master/test/page2.lua)

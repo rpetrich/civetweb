@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdexcept>
 
 #ifndef UNUSED_PARAMETER
 #define UNUSED_PARAMETER(x) (void)(x)
@@ -51,10 +52,14 @@ bool CivetHandler::handleOptions(CivetServer *server, struct mg_connection *conn
 
 int CivetServer::requestHandler(struct mg_connection *conn, void *cbdata)
 {
-    struct mg_request_info *request_info = mg_get_request_info(conn);
+    const struct mg_request_info *request_info = mg_get_request_info(conn);
     assert(request_info != NULL);
     CivetServer *me = (CivetServer*) (request_info->user_data);
     assert(me != NULL);
+
+    // Happens when a request hits the server before the context is saved
+    if (me->context == NULL) return 0;
+
     mg_lock_context(me->context);
     me->connections[conn] = CivetConnection();
     mg_unlock_context(me->context);
@@ -93,6 +98,7 @@ CivetServer::CivetServer(const char **options,
     }
     callbacks.connection_close = closeHandler;
     context = mg_start(&callbacks, this, options);
+    if (context == NULL) throw CivetException("null context when constructing CivetServer. Possible problem binding to port.");
 }
 
 CivetServer::~CivetServer()
@@ -100,16 +106,19 @@ CivetServer::~CivetServer()
     close();
 }
 
-void CivetServer::closeHandler(struct mg_connection *conn)
+void CivetServer::closeHandler(const struct mg_connection *conn)
 {
-    struct mg_request_info *request_info = mg_get_request_info(conn);
+    const struct mg_request_info *request_info = mg_get_request_info(conn);
     assert(request_info != NULL);
     CivetServer *me = (CivetServer*) (request_info->user_data);
     assert(me != NULL);
 
+    // Happens when a request hits the server before the context is saved
+    if (me->context == NULL) return;
+
     if (me->userCloseHandler) me->userCloseHandler(conn);
     mg_lock_context(me->context);
-    me->connections.erase(conn);
+    me->connections.erase(const_cast<struct mg_connection *>(conn));
     mg_unlock_context(me->context);
 }
 
@@ -181,7 +190,7 @@ CivetServer::getParam(struct mg_connection *conn, const char *name,
                       std::string &dst, size_t occurrence)
 {
     const char *formParams = NULL;
-    struct mg_request_info *ri = mg_get_request_info(conn);
+    const struct mg_request_info *ri = mg_get_request_info(conn);
     assert(ri != NULL);
     CivetServer *me = (CivetServer*) (ri->user_data);
     assert(me != NULL);
@@ -286,6 +295,18 @@ CivetServer::urlEncode(const char *src, size_t src_len, std::string &dst, bool a
         }
     }
 }
+
+std::vector<int>
+CivetServer::getListeningPorts()
+{
+    std::vector<int> ports(10);
+    std::vector<int> ssl(10);
+    size_t size = mg_get_ports(context, ports.size(), &ports[0], &ssl[0]);
+    ports.resize(size);
+    ssl.resize(size);
+    return ports;
+}
+
 
 CivetServer::CivetConnection::CivetConnection() {
     postData = NULL;
