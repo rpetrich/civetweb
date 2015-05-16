@@ -11,15 +11,26 @@
 #include "civetweb.h"
 #include <map>
 #include <string>
+#include <vector>
+#include <stdexcept>
 
 // forward declaration
 class CivetServer;
 
 /**
+ * Exception class for thrown exceptions within the CivetHandler object.
+ */
+class CIVETWEB_API CivetException : public std::runtime_error
+{
+    public:
+    CivetException(const std::string& msg) : std::runtime_error(msg) {}
+};
+
+/**
  * Basic interface for a URI request handler.  Handlers implementations
  * must be reentrant.
  */
-class CivetHandler
+class CIVETWEB_API CivetHandler
 {
 public:
 
@@ -80,7 +91,7 @@ public:
  *
  * Basic class for embedded web server.  This has an URL mapping built-in.
  */
-class CivetServer
+class CIVETWEB_API CivetServer
 {
 public:
 
@@ -93,6 +104,8 @@ public:
      *
      * @param options - the web server options.
      * @param callbacks - optional web server callback methods.
+     *
+     * @throws CivetException
      */
     CivetServer(const char **options, const struct mg_callbacks *callbacks = 0);
 
@@ -126,10 +139,13 @@ public:
      * URI's are ordered and prefix (REST) URI's are supported.
      *
      *  @param uri - URI to match.
-     *  @param handler - handler instance to use.  This will be free'ed
-     *      when the server closes and instances cannot be reused.
+     *  @param handler - handler instance to use.
      */
     void addHandler(const std::string &uri, CivetHandler *handler);
+
+    void addHandler(const std::string &uri, CivetHandler &handler) {
+        addHandler(uri, &handler);
+    }
 
     /**
      * removeHandler(const std::string &)
@@ -139,6 +155,16 @@ public:
      * @param uri - the exact URL used in addHandler().
      */
     void removeHandler(const std::string &uri);
+
+    /**
+     * getListeningPorts()
+     *
+     * Returns a list of ports that are listening
+     *
+     * @return A vector of ports
+     */
+
+    std::vector<int> getListeningPorts();
 
     /**
      * getCookie(struct mg_connection *conn, const std::string &cookieName, std::string &cookieValue)
@@ -318,12 +344,12 @@ private:
      *
      * @param conn - the connection information
      */
-    static void closeHandler(struct mg_connection *conn);
+    static void closeHandler(const struct mg_connection *conn);
 
     /**
      * Stores the user provided close handler
      */
-    void (*userCloseHandler)(struct mg_connection *conn);
+    void (*userCloseHandler)(const struct mg_connection *conn);
 
 };
 

@@ -1,5 +1,6 @@
 
 civetweb
+civetweb_test
 libcivetweb.a
 libcivetweb.so
 *-cache
@@ -9,6 +10,8 @@ out
 *.exe
 *.zip
 Output
+
+*.o
 
 #################
 ## Eclipse
@@ -234,4 +237,15 @@ requests.db
 ## Files created by ctags
 ##########################
 tags
+
+##########################
+## Files created by autotools
+##########################
+*.lo
+.libs
+
+##########################
+## Travis Build Dir
+##########################
+ci/lua
 
