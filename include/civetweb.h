@@ -407,7 +407,10 @@ CIVETWEB_API const struct mg_request_info *mg_get_request_info(const struct mg_c
     >0  number of bytes written on success */
 CIVETWEB_API int mg_write(struct mg_connection *, const void *buf, size_t len);
 
-/* Finish with client */
+/* Flush data to the client, potentially closes the connection if keep alive isn't supported */
+CIVETWEB_API void mg_flush_response(struct mg_connection *);
+
+/* Close the connection early */
 CIVETWEB_API void mg_finish(struct mg_connection *);
 
 
