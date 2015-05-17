@@ -778,7 +778,7 @@ enum {
     ACCESS_LOG_FILE, ENABLE_DIRECTORY_LISTING, ERROR_LOG_FILE,
     GLOBAL_PASSWORDS_FILE, INDEX_FILES, ENABLE_KEEP_ALIVE, ACCESS_CONTROL_LIST,
     EXTRA_MIME_TYPES, LISTENING_PORTS, DOCUMENT_ROOT, SSL_CERTIFICATE,
-    NUM_THREADS, RUN_AS_USER, REWRITE, HIDE_FILES, REQUEST_TIMEOUT,
+    NUM_THREADS, RUN_AS_USER, REWRITE, HIDE_FILES, REQUEST_TIMEOUT, IDLE_TIMEOUT,
     DECODE_URL,
 
 #if defined(USE_LUA)
@@ -826,6 +826,7 @@ static struct mg_option config_options[] = {
     {"url_rewrite_patterns",        CONFIG_TYPE_STRING,        NULL},
     {"hide_files_patterns",         CONFIG_TYPE_EXT_PATTERN,   NULL},
     {"request_timeout_ms",          CONFIG_TYPE_NUMBER,        "30000"},
+    {"idle_timeout_ms",             CONFIG_TYPE_NUMBER,        "-1"},
     {"decode_url",                  CONFIG_TYPE_BOOLEAN,       "yes"},
 
 #if defined(USE_LUA)
@@ -874,10 +875,12 @@ struct mg_context {
     volatile int stop_flag;         /* Should we stop event loop */
     SSL_CTX *ssl_ctx;               /* SSL context */
     char *config[NUM_OPTIONS];      /* Civetweb configuration parameters */
-    int timeout;
     struct mg_callbacks callbacks;  /* User-defined callback function */
     void *user_data;                /* User-defined data */
     int context_type;               /* 1 = server context, 2 = client context */
+
+    int sock_timeout;               /* OS-level timeout to set on the socket */
+    double request_timeout;         /* Request-level timeout from start to finish */
 
     struct socket *listening_sockets;
     in_port_t *listening_ports;
@@ -2622,17 +2625,14 @@ static int64_t push(FILE *fp, SOCKET sock, SSL *ssl, const char *buf, int64_t le
 static int pull(FILE *fp, struct mg_connection *conn, char *buf, int len)
 {
     int nread;
-    double timeout = -1;
+    double timeout;
     struct timespec start, now;
 
-    memset(&start, 0, sizeof(start));
-    memset(&now, 0, sizeof(now));
-
-    if (conn->ctx->config[REQUEST_TIMEOUT]) {
-        timeout = atoi(conn->ctx->config[REQUEST_TIMEOUT]) / 1000.0;
-    }
+    timeout = conn->ctx->request_timeout;
     if (timeout>0) {
+        memset(&start, 0, sizeof(start));
         clock_gettime(CLOCK_MONOTONIC, &start);
+        memset(&now, 0, sizeof(now));
     }
 
     do {
@@ -4612,14 +4612,7 @@ static int read_request(FILE *fp, struct mg_connection *conn,
 {
     int request_len, n = 0;
     struct timespec last_action_time = {0, 0};
-    double request_timeout;
-
-    if (conn->ctx->config[REQUEST_TIMEOUT]) {
-        /* value of request_timeout is in seconds, config in milliseconds */
-        request_timeout = atof(conn->ctx->config[REQUEST_TIMEOUT]) / 1000.0;
-    } else {
-        request_timeout = -1.0;
-    }
+    double request_timeout = conn->ctx->request_timeout;
 
     request_len = get_request_len(buf, *nread);
     while ((conn->ctx->stop_flag == 0) &&
@@ -7786,7 +7779,9 @@ static int getreq(struct mg_connection *conn, char *ebuf, size_t ebuf_len, int *
     reset_per_request_attributes(conn);
 
     /* Set the time the request was received. This value should be used for timeouts. */
-    clock_gettime(CLOCK_MONOTONIC, &(conn->req_time));
+    if (conn->ctx->request_timeout != -1) {
+        clock_gettime(CLOCK_MONOTONIC, &(conn->req_time));
+    }
 
     conn->request_len = read_request(NULL, conn, conn->buf, conn->buf_size,
                                      &conn->data_len);
@@ -7848,14 +7843,12 @@ int mg_get_response(struct mg_connection *conn, char *ebuf, size_t ebuf_len, int
     int err, ret;
     struct mg_context *octx = conn->ctx;
     struct mg_context rctx = *(conn->ctx);
-    char txt[32];
 
     if (timeout >= 0) {
-        snprintf(txt, sizeof(txt), "%i", timeout);
-        rctx.config[REQUEST_TIMEOUT] = txt;
+        rctx.request_timeout = timeout / 1000.0;
         set_sock_timeout(conn->client.sock, timeout);
     } else {
-        rctx.config[REQUEST_TIMEOUT] = NULL;
+        rctx.request_timeout = -1;
     }
 
     conn->ctx = &rctx;
@@ -8251,7 +8244,7 @@ static void accept_new_connection(const struct socket *listener,
     char src_addr[IP_ADDR_STR_LEN];
     socklen_t len = sizeof(so.rsa);
     int on = 1;
-    int timeout;
+    int sock_timeout;
 
     if ((so.sock = accept(listener->sock, &so.rsa.sa, &len)) == INVALID_SOCKET) {
     } else if (!check_acl(ctx, ntohl(* (uint32_t *) &so.rsa.sin.sin_addr))) {
@@ -8284,9 +8277,9 @@ static void accept_new_connection(const struct socket *listener,
                    __func__, strerror(ERRNO));
         }
 
-        timeout = ctx->timeout;
-        if (timeout != -1) {
-            set_sock_timeout(so.sock, timeout);
+        sock_timeout = ctx->sock_timeout;
+        if (sock_timeout != -1) {
+            set_sock_timeout(so.sock, sock_timeout);
         }
         produce_socket(ctx, &so);
     }
@@ -8529,7 +8522,7 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
     int i, ok;
     int workerthreadcount;
     void (*exit_callback)(const struct mg_context * ctx) = 0;
-    int timeout;
+    int request_timeout, idle_timeout;
 
 #if defined(_WIN32) && !defined(__SYMBIAN32__)
     WSADATA data;
@@ -8617,11 +8610,19 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
        so the server can exit after 10 seconds if required. */
     /* TODO: Currently values > 10 s are round up to the next 10 s.
              For values like 24 s a socket timeout of 8 or 12 s would be better. */
-    timeout = atoi(ctx->config[REQUEST_TIMEOUT]);
-    if ((timeout>0) && (timeout<10000)) {
-        ctx->timeout = timeout;
+    idle_timeout = atoi(ctx->config[IDLE_TIMEOUT]);
+    request_timeout = atoi(ctx->config[REQUEST_TIMEOUT]);
+    if (idle_timeout != -1) {
+        ctx->sock_timeout = idle_timeout;
+    } else if ((request_timeout>0) && (request_timeout<10000)) {
+        ctx->sock_timeout = request_timeout;
     } else {
-        ctx->timeout = 10000;
+        ctx->sock_timeout = 10000;
+    }
+    if (request_timeout != -1) {
+        ctx->request_timeout = request_timeout / 1000.0;
+    } else {
+        ctx->request_timeout = -1;
     }
 
 #if defined(NO_FILES)
