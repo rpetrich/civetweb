@@ -329,6 +329,7 @@ struct pollfd {
 #include <sys/socket.h>
 #include <sys/poll.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
@@ -7670,6 +7671,20 @@ static void close_connection(struct mg_connection *conn)
 #if defined(USE_WEBSOCKET)
     mg_unlock_connection(conn);
 #endif
+}
+
+void mg_flush_response(struct mg_connection *conn)
+{
+    int sock = conn->client.sock;
+    if (sock != INVALID_SOCKET) {
+        if (should_keep_alive(conn)) {
+            int flag = 1;
+            if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int)) != -1) {
+                return;
+            }
+        }
+        close_connection(conn);
+    }
 }
 
 void mg_finish(struct mg_connection *conn)
