@@ -899,7 +899,7 @@ struct mg_context {
     pthread_mutex_t thread_mutex;   /* Protects (max|num)_threads */
     pthread_cond_t thread_cond;     /* Condvar for tracking workers terminations */
 
-    struct socket queue[MGSQLEN];   /* Accepted sockets */
+    struct mg_connection *queue[MGSQLEN];   /* Accepted sockets */
     volatile int sq_head;           /* Head of the socket queue */
     volatile int sq_tail;           /* Tail of the socket queue */
     pthread_cond_t sq_full;         /* Signaled when socket is produced */
@@ -8132,7 +8132,7 @@ static void process_new_connection(struct mg_connection *conn)
 }
 
 /* Worker threads take accepted socket from the queue */
-static int consume_socket(struct mg_context *ctx, struct socket *sp)
+static int consume_socket(struct mg_context *ctx, struct mg_connection **cp)
 {
     (void) pthread_mutex_lock(&ctx->thread_mutex);
     DEBUG_TRACE("%s", "going idle");
@@ -8145,15 +8145,17 @@ static int consume_socket(struct mg_context *ctx, struct socket *sp)
     /* If we're stopping, sq_head may be equal to sq_tail. */
     if (ctx->sq_head > ctx->sq_tail) {
         /* Copy socket from the queue and increment tail */
-        *sp = ctx->queue[ctx->sq_tail % ARRAY_SIZE(ctx->queue)];
+        *cp = ctx->queue[ctx->sq_tail % ARRAY_SIZE(ctx->queue)];
         ctx->sq_tail++;
-        DEBUG_TRACE("grabbed socket %d, going busy", sp->sock);
+        DEBUG_TRACE("grabbed socket %d, going busy", cp->client.sock);
 
         /* Wrap pointers if needed */
         while (ctx->sq_tail > (int) ARRAY_SIZE(ctx->queue)) {
             ctx->sq_tail -= ARRAY_SIZE(ctx->queue);
             ctx->sq_head -= ARRAY_SIZE(ctx->queue);
         }
+    } else {
+        *cp = NULL;
     }
 
     (void) pthread_cond_signal(&ctx->sq_empty);
@@ -8175,48 +8177,15 @@ static void *worker_thread_run(void *thread_func_param)
     tls.pthread_cond_helper_mutex = CreateEvent(NULL, FALSE, FALSE, NULL);
 #endif
 
-    conn = (struct mg_connection *) mg_calloc(1, sizeof(*conn));
-    if (conn == NULL) {
-        mg_cry(fc(ctx), "%s", "Cannot create new connection struct, OOM");
-    } else {
-        pthread_setspecific(sTlsKey, &tls);
-        conn->ctx = ctx;
-        conn->request_info.user_data = ctx->user_data;
-        /* Allocate a mutex for this connection to allow communication both
-           within the request handler and from elsewhere in the application */
-#if defined(USE_WEBSOCKET)
-        (void) pthread_mutex_init(&conn->mutex, NULL);
-#endif
+    pthread_setspecific(sTlsKey, &tls);
 
-        /* Call consume_socket() even when ctx->stop_flag > 0, to let it
-           signal sq_empty condvar to wake up the master waiting in
-           produce_socket() */
-        while (consume_socket(ctx, &conn->client)) {
-            conn->conn_birth_time = time(NULL);
-
-            /* Fill in IP, port info early so even if SSL setup below fails,
-               error handler would have the corresponding info.
-               Thanks to Johannes Winkelmann for the patch.
-               TODO(lsm): Fix IPv6 case */
-            conn->request_info.remote_port = ntohs(conn->client.rsa.sin.sin_port);
-            sockaddr_to_string(conn->request_info.remote_addr, sizeof(conn->request_info.remote_addr), &conn->client.rsa);
-/* TODO: #if defined(MG_LEGACY_INTERFACE) */
-            memcpy(&conn->request_info.remote_ip,
-                   &conn->client.rsa.sin.sin_addr.s_addr, 4);
-            conn->request_info.remote_ip = ntohl(conn->request_info.remote_ip);
-/* #endif */
-            conn->request_info.is_ssl = conn->client.is_ssl;
-
-            if (!conn->client.is_ssl
-#ifndef NO_SSL
-                || sslize(conn, conn->ctx->ssl_ctx, SSL_accept)
-#endif
-               ) {
-                process_new_connection(conn);
-            }
-
-            close_connection(conn);
-        }
+    /* Call consume_socket() even when ctx->stop_flag > 0, to let it
+       signal sq_empty condvar to wake up the master waiting in
+       produce_socket() */
+    while (consume_socket(ctx, &conn)) {
+        process_new_connection(conn);
+        close_connection(conn);
+        mg_free(conn);
     }
 
     /* Signal master that we're done with connection and exiting */
@@ -8230,7 +8199,6 @@ static void *worker_thread_run(void *thread_func_param)
 #if defined(_WIN32) && !defined(__SYMBIAN32__)
     CloseHandle(tls.pthread_cond_helper_mutex);
 #endif
-    mg_free(conn);
 
     DEBUG_TRACE("%s", "exiting");
     return NULL;
@@ -8253,7 +8221,7 @@ static void *worker_thread(void *thread_func_param)
 #endif /* _WIN32 */
 
 /* Master thread adds accepted socket to a queue */
-static void produce_socket(struct mg_context *ctx, const struct socket *sp)
+static void produce_socket(struct mg_context *ctx, struct mg_connection *sp)
 {
     (void) pthread_mutex_lock(&ctx->thread_mutex);
 
@@ -8265,9 +8233,9 @@ static void produce_socket(struct mg_context *ctx, const struct socket *sp)
 
     if (ctx->sq_head - ctx->sq_tail < (int) ARRAY_SIZE(ctx->queue)) {
         /* Copy socket to the queue and increment head */
-        ctx->queue[ctx->sq_head % ARRAY_SIZE(ctx->queue)] = *sp;
+        ctx->queue[ctx->sq_head % ARRAY_SIZE(ctx->queue)] = sp;
         ctx->sq_head++;
-        DEBUG_TRACE("queued socket %d", sp->sock);
+        DEBUG_TRACE("queued socket %d", sp->client.sock);
     }
 
     (void) pthread_cond_signal(&ctx->sq_full);
@@ -8319,7 +8287,44 @@ static void accept_new_connection(const struct socket *listener,
         if (sock_timeout != -1) {
             set_sock_timeout(so.sock, sock_timeout);
         }
-        produce_socket(ctx, &so);
+        struct mg_connection *conn = (struct mg_connection *) mg_calloc(1, sizeof(*conn));
+        if (conn == NULL) {
+            mg_cry(fc(ctx), "%s", "Cannot create new connection struct, OOM");
+        } else {
+            conn->client = so;
+            conn->conn_birth_time = time(NULL);
+            conn->ctx = ctx;
+            conn->request_info.user_data = ctx->user_data;
+            /* Allocate a mutex for this connection to allow communication both
+               within the request handler and from elsewhere in the application */
+#if defined(USE_WEBSOCKET)
+            (void) pthread_mutex_init(&conn->mutex, NULL);
+#endif
+
+            /* Fill in IP, port info early so even if SSL setup below fails,
+               error handler would have the corresponding info.
+               Thanks to Johannes Winkelmann for the patch.
+               TODO(lsm): Fix IPv6 case */
+            conn->request_info.remote_port = ntohs(conn->client.rsa.sin.sin_port);
+            sockaddr_to_string(conn->request_info.remote_addr, sizeof(conn->request_info.remote_addr), &conn->client.rsa);
+/* TODO: #if defined(MG_LEGACY_INTERFACE) */
+            memcpy(&conn->request_info.remote_ip,
+                   &conn->client.rsa.sin.sin_addr.s_addr, 4);
+            conn->request_info.remote_ip = ntohl(conn->request_info.remote_ip);
+/* #endif */
+            conn->request_info.is_ssl = conn->client.is_ssl;
+
+            if (!conn->client.is_ssl
+#ifndef NO_SSL
+                || sslize(conn, conn->ctx->ssl_ctx, SSL_accept)
+#endif
+               ) {
+                produce_socket(ctx, conn);
+            } else {
+                close_connection(conn);
+                mg_free(conn);
+            }
+        }
     }
 }
 
