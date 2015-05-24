@@ -943,11 +943,9 @@ struct mg_connection {
     int64_t consumed_content;       /* How many bytes of content have been read */
     int is_chunked;                 /* Transfer-encoding is chunked: 0=no, 1=yes: data available, 2: all data read */
     size_t chunk_remainder;         /* Unread data from the last chunk */
-    char *buf;                      /* Buffer for received data */
     char *path_info;                /* PATH_INFO part of the URL */
     int must_close;                 /* 1 if connection must be closed */
     int in_error_handler;           /* 1 if in handler for user defined error pages */
-    int buf_size;                   /* Buffer size */
     int request_len;                /* Size of the request + headers in a buffer */
     int data_len;                   /* Total size of data in a buffer */
     int status_code;                /* HTTP reply status code, e.g. 200 */
@@ -960,6 +958,7 @@ struct mg_connection {
 #if defined(USE_LUA) && defined(USE_WEBSOCKET)
     void * lua_websocket_state;     /* Lua_State for a websocket connection */
 #endif
+    char buf[MAX_REQUEST_SIZE];
 };
 
 static pthread_key_t sTlsKey;  /* Thread local storage index */
@@ -7776,8 +7775,6 @@ struct mg_connection *mg_connect_client(const char *host, int port, int use_ssl,
 #endif /* NO_SSL */
     } else {
         socklen_t len = sizeof(struct sockaddr);
-        conn->buf_size = MAX_REQUEST_SIZE;
-        conn->buf = (char *) (conn + 1);
         conn->ctx = &fake_ctx;
         conn->client.sock = sock;
         if (getsockname(sock, &conn->client.rsa.sa, &len) != 0) {
@@ -7826,11 +7823,11 @@ static int getreq(struct mg_connection *conn, char *ebuf, size_t ebuf_len, int *
         clock_gettime(CLOCK_MONOTONIC, &(conn->req_time));
     }
 
-    conn->request_len = read_request(NULL, conn, conn->buf, conn->buf_size,
+    conn->request_len = read_request(NULL, conn, conn->buf, MAX_REQUEST_SIZE,
                                      &conn->data_len);
     assert(conn->request_len < 0 || conn->data_len >= conn->request_len);
 
-    if (conn->request_len == 0 && conn->data_len == conn->buf_size) {
+    if (conn->request_len == 0 && conn->data_len == MAX_REQUEST_SIZE) {
         snprintf(ebuf, ebuf_len, "%s", "Request Too Large");
         *err = 413;
         return 0;
@@ -7845,7 +7842,7 @@ static int getreq(struct mg_connection *conn, char *ebuf, size_t ebuf_len, int *
             *err = 0;
         }
         return 0;
-    } else if (parse_http_message(conn->buf, conn->buf_size,
+    } else if (parse_http_message(conn->buf, MAX_REQUEST_SIZE,
                                   &conn->request_info) <= 0) {
         snprintf(ebuf, ebuf_len, "Bad request: [%.*s]", conn->data_len, conn->buf);
         *err = 400;
@@ -8129,7 +8126,7 @@ static void process_new_connection(struct mg_connection *conn)
         memmove(conn->buf, conn->buf + discard_len, conn->data_len - discard_len);
         conn->data_len -= discard_len;
         assert(conn->data_len >= 0);
-        assert(conn->data_len <= conn->buf_size);
+        assert(conn->data_len <= MAX_REQUEST_SIZE);
 
     } while (keep_alive);
 }
@@ -8178,13 +8175,11 @@ static void *worker_thread_run(void *thread_func_param)
     tls.pthread_cond_helper_mutex = CreateEvent(NULL, FALSE, FALSE, NULL);
 #endif
 
-    conn = (struct mg_connection *) mg_calloc(1, sizeof(*conn) + MAX_REQUEST_SIZE);
+    conn = (struct mg_connection *) mg_calloc(1, sizeof(*conn));
     if (conn == NULL) {
         mg_cry(fc(ctx), "%s", "Cannot create new connection struct, OOM");
     } else {
         pthread_setspecific(sTlsKey, &tls);
-        conn->buf_size = MAX_REQUEST_SIZE;
-        conn->buf = (char *) (conn + 1);
         conn->ctx = ctx;
         conn->request_info.user_data = ctx->user_data;
         /* Allocate a mutex for this connection to allow communication both
