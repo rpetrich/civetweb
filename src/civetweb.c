@@ -476,6 +476,8 @@ static int pthread_setspecific(pthread_key_t key, void *value)
 #ifdef ENABLE_UNUSED_PTHREAD_FUNCTIONS
 static void *pthread_getspecific(pthread_key_t key) { return TlsGetValue(key); }
 #endif
+#else
+#include <sched.h>
 #endif /* _WIN32 */
 
 #include "civetweb.h"
@@ -2654,6 +2656,12 @@ static int mg_join_thread(pthread_t threadid)
 	return result;
 }
 
+static int sched_yield(void)
+{
+	(void)SwitchToThread();
+	return 0;
+}
+
 static HANDLE dlopen(const char *dll_name, int flags)
 {
 	wchar_t wbuf[PATH_MAX];
@@ -2980,6 +2988,14 @@ static int set_non_blocking_mode(SOCKET sock, int enabled)
 }
 #endif /* _WIN32 */
 
+static void mg_set_non_blocking(struct mg_connection *conn, int enabled)
+{
+	if (conn->is_non_blocking != enabled) {
+		conn->is_non_blocking = enabled;
+		set_non_blocking_mode(conn->client.sock, enabled);
+	}
+}
+
 /* Write data to the IO channel - opened file descriptor, socket or SSL
  * descriptor. Return number of bytes written. */
 static int64_t
@@ -3030,6 +3046,8 @@ static int pull(FILE *fp, struct mg_connection *conn, char *buf, int len)
 		clock_gettime(CLOCK_MONOTONIC, &start);
 		memset(&now, 0, sizeof(now));
 	}
+
+	mg_set_non_blocking(conn, 0);
 
 	do {
 		if (fp != NULL) {
@@ -3268,6 +3286,8 @@ int mg_write(struct mg_connection *conn, const void *buf, size_t len)
 	if (conn == NULL) {
 		return 0;
 	}
+
+	mg_set_non_blocking(conn, 0);
 
 	if (conn->throttle > 0) {
 		if ((now = time(NULL)) != conn->last_throttle_time) {
@@ -8834,10 +8854,7 @@ static void close_socket_gracefully(struct mg_connection *conn)
 		mg_free(data);
 	}
 #endif
-	if (!conn->is_non_blocking) {
-		conn->is_non_blocking = 1;
-		set_non_blocking_mode(socket_fd, 1);
-	}
+	mg_set_non_blocking(conn, 1);
 	conn->client.sock = INVALID_SOCKET;
 
 #if defined(_WIN32)
@@ -9026,6 +9043,7 @@ getreq(struct mg_connection *conn, char *ebuf, size_t ebuf_len, int *err)
 		*err = 500;
 		return 0;
 	}
+
 	/* Set the time the request was received. This value should be used for
 	 * timeouts. */
 	if (conn->ctx->request_timeout != -1) {
@@ -9319,10 +9337,6 @@ static void process_connection(struct mg_connection *conn)
 		char ebuf[100];
 		int reqerr;
 
-		if (conn->is_non_blocking) {
-			conn->is_non_blocking = 0;
-			set_non_blocking_mode(conn->client.sock, 0);
-		}
 		do {
 			if (!getreq(conn, ebuf, sizeof(ebuf), &reqerr)) {
 				/* The request sent by the client could not be understood by
@@ -9393,12 +9407,23 @@ static void process_connection(struct mg_connection *conn)
 			if (keep_alive) {
 				reset_per_request_attributes(conn);
 #if !defined(CIVET_NO_EPOLL)
-				if (get_request_len(conn->buf, conn->data_len) == 0) {
-					struct epoll_event event;
-					event.events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
-					event.data.ptr = conn;
-					if (connection_epoll_ctl(conn, &event) != -1) {
-						return;
+				if (conn->ctx->epoll_fd != -1) {
+					// Speculatively try to read the next request
+					mg_set_non_blocking(conn, 1);
+					sched_yield();
+					int data_len = conn->data_len;
+					int n = (int)recv(conn->client.sock, conn->buf + data_len, (size_t)MAX_REQUEST_SIZE - data_len, 0);
+					if (n > 0) {
+						data_len += n;
+						conn->data_len = data_len;
+					}
+					if (get_request_len(conn->buf, data_len) == 0) {
+						struct epoll_event event;
+						event.events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
+						event.data.ptr = conn;
+						if (connection_epoll_ctl(conn, &event) != -1) {
+							return;
+						}
 					}
 				}
 #endif
@@ -9676,10 +9701,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 		case EPOLL_DATA_TYPE_READ_REQUEST: {
 			struct mg_connection *conn = event->data.ptr;
 			if (event->events & EPOLLIN) {
-				if (!conn->is_non_blocking) {
-					conn->is_non_blocking = 1;
-					set_non_blocking_mode(conn->client.sock, 1);
-				}
+				mg_set_non_blocking(conn, 1);
 				int data_len = conn->data_len;
 				int n = (int)recv(conn->client.sock, conn->buf + data_len, (size_t)MAX_REQUEST_SIZE - data_len, 0);
 				if (n < 0) {
