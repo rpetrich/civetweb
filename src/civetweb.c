@@ -982,6 +982,7 @@ struct mg_connection {
     int throttle;                   /* Throttling, bytes/sec. <= 0 means no throttle */
     time_t last_throttle_time;      /* Last time throttled data was sent */
     int64_t last_throttle_bytes;    /* Bytes sent this second */
+    int is_non_blocking;
 #if defined(USE_WEBSOCKET)
     pthread_mutex_t mutex;          /* Used by mg_lock_connection/mg_unlock_connection to ensure atomic transmissions for websockets */
 #endif
@@ -2465,9 +2466,9 @@ static pid_t spawn_process(struct mg_connection *conn, const char *prog,
 }
 #endif /* !NO_CGI */
 
-static int set_non_blocking_mode(SOCKET sock)
+static int set_non_blocking_mode(SOCKET sock, int value)
 {
-    unsigned long on = 1;
+    unsigned long on = value;
     return ioctlsocket(sock, FIONBIO, &on);
 }
 
@@ -2606,7 +2607,7 @@ static pid_t spawn_process(struct mg_connection *conn, const char *prog,
 }
 #endif /* !NO_CGI */
 
-static int set_non_blocking_mode(SOCKET sock)
+static int set_non_blocking_mode(SOCKET sock, int value)
 {
     int flags;
 
@@ -2615,7 +2616,7 @@ static int set_non_blocking_mode(SOCKET sock)
 #else
     flags = fcntl(sock, F_GETFL, 0);
 #endif
-    (void) fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    (void) fcntl(sock, F_SETFL, value ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK) );
 
     return 0;
 }
@@ -7686,7 +7687,10 @@ static void close_socket_gracefully(struct mg_connection *conn)
         mg_free(data);
     }
 #endif
-    set_non_blocking_mode(socket_fd);
+    if (!conn->is_non_blocking) {
+        conn->is_non_blocking = 1;
+        set_non_blocking_mode(socket_fd, 1);
+    }
     conn->client.sock = INVALID_SOCKET;
 
 #if defined(_WIN32)
@@ -8113,6 +8117,10 @@ static void process_connection(struct mg_connection *conn)
     char ebuf[100];
     int reqerr;
 
+    if (conn->is_non_blocking) {
+        conn->is_non_blocking = 0;
+        set_non_blocking_mode(conn->client.sock, 0);
+    }
     do {
         if (!getreq(conn, ebuf, sizeof(ebuf), &reqerr)) {
             /* The request sent by the client could not be understood by the server,
@@ -8412,8 +8420,12 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
         case EPOLL_DATA_TYPE_READ_REQUEST: {
             struct mg_connection *conn = event->data.ptr;
             if (event->events & EPOLLIN) {
+                if (!conn->is_non_blocking) {
+                    conn->is_non_blocking = 1;
+                    set_non_blocking_mode(conn->client.sock, 1);
+                }
                 int data_len = conn->data_len;
-                int n = pull(NULL, conn, conn->buf + data_len, MAX_REQUEST_SIZE - data_len);
+                int n = (int)recv(conn->client.sock, conn->buf + data_len, (size_t)MAX_REQUEST_SIZE - data_len, 0);
                 if (n < 0) {
                     // Socket has an error, just tear it down
                     close_connection(conn);
