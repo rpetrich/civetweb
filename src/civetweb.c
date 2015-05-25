@@ -870,6 +870,7 @@ struct socket {
 	unsigned char is_ssl;    /* Is port SSL-ed */
 	unsigned char ssl_redir; /* Is port supposed to redirect everything to SSL
 	                          * port */
+	unsigned char is_non_blocking; /* Is currently in non-blocking mode */
 };
 
 /* NOTE(lsm): this enum shoulds be in sync with the config_options below. */
@@ -1114,7 +1115,6 @@ struct mg_connection {
 	                              * throttle */
 	time_t last_throttle_time;   /* Last time throttled data was sent */
 	int64_t last_throttle_bytes; /* Bytes sent this second */
-	int is_non_blocking;         /* Currently in non-blocking mode */
 #if defined(USE_WEBSOCKET)
 	pthread_mutex_t mutex;       /* Used by mg_(un)lock_connection to ensure
 	                              * atomic transmissions for websockets */
@@ -2982,18 +2982,19 @@ static int set_non_blocking_mode(SOCKET sock, int enabled)
 #else
 	flags = fcntl(sock, F_GETFL, 0);
 #endif
-	(void)fcntl(sock, F_SETFL, enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
-
-	return 0;
+	return fcntl(sock, F_SETFL, enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
 }
 #endif /* _WIN32 */
 
-static void mg_set_non_blocking(struct mg_connection *conn, int enabled)
+static int mg_set_non_blocking(struct socket *s, int enabled)
 {
-	if (conn->is_non_blocking != enabled) {
-		conn->is_non_blocking = enabled;
-		set_non_blocking_mode(conn->client.sock, enabled);
+	if (s->is_non_blocking == enabled)
+		return 0;
+	int result = set_non_blocking_mode(s->sock, enabled);
+	if (result == 0) {
+		s->is_non_blocking = enabled;
 	}
+	return result;
 }
 
 /* Write data to the IO channel - opened file descriptor, socket or SSL
@@ -3047,7 +3048,7 @@ static int pull(FILE *fp, struct mg_connection *conn, char *buf, int len)
 		memset(&now, 0, sizeof(now));
 	}
 
-	mg_set_non_blocking(conn, 0);
+	mg_set_non_blocking(&conn->client, 0);
 
 	do {
 		if (fp != NULL) {
@@ -3287,7 +3288,7 @@ int mg_write(struct mg_connection *conn, const void *buf, size_t len)
 		return 0;
 	}
 
-	mg_set_non_blocking(conn, 0);
+	mg_set_non_blocking(&conn->client, 0);
 
 	if (conn->throttle > 0) {
 		if ((now = time(NULL)) != conn->last_throttle_time) {
@@ -8328,6 +8329,8 @@ static int set_ports_option(struct mg_context *ctx)
 				mg_free(ptr);
 				success = 0;
 			} else {
+				so.is_non_blocking = 0;
+				mg_set_non_blocking(&so, 1);
 #if !defined(CIVET_NO_CLOEXEC)
 				set_close_on_exec(so.sock, fc(ctx));
 #endif
@@ -8854,7 +8857,7 @@ static void close_socket_gracefully(struct mg_connection *conn)
 		mg_free(data);
 	}
 #endif
-	mg_set_non_blocking(conn, 1);
+	mg_set_non_blocking(&conn->client, 1);
 	conn->client.sock = INVALID_SOCKET;
 
 #if defined(_WIN32)
@@ -9409,7 +9412,7 @@ static void process_connection(struct mg_connection *conn)
 #if !defined(CIVET_NO_EPOLL)
 				if (conn->ctx->epoll_fd != -1) {
 					// Speculatively try to read the next request
-					mg_set_non_blocking(conn, 1);
+					mg_set_non_blocking(&conn->client, 1);
 					sched_yield();
 					int data_len = conn->data_len;
 					int n = (int)recv(conn->client.sock, conn->buf + data_len, (size_t)MAX_REQUEST_SIZE - data_len, 0);
@@ -9629,6 +9632,13 @@ static void accept_new_connection(const struct socket *listener,
 			closesocket(so.sock);
 			so.sock = INVALID_SOCKET;
 		} else {
+#ifdef __linux__
+			/* On Linux, accepted sockets don't inherit the non-blocking status from
+			 * the parent socket. Would use accept4, but it is less supported */
+			so.is_non_blocking = 0;
+#else
+			so.is_non_blocking = listener->is_non_blocking;
+#endif
 			conn->conn_birth_time = time(NULL);
 			conn->client = so;
 			conn->ctx = ctx;
@@ -9701,7 +9711,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 		case EPOLL_DATA_TYPE_READ_REQUEST: {
 			struct mg_connection *conn = event->data.ptr;
 			if (event->events & EPOLLIN) {
-				mg_set_non_blocking(conn, 1);
+				mg_set_non_blocking(&conn->client, 1);
 				int data_len = conn->data_len;
 				int n = (int)recv(conn->client.sock, conn->buf + data_len, (size_t)MAX_REQUEST_SIZE - data_len, 0);
 				if (n < 0) {
