@@ -2465,13 +2465,11 @@ static pid_t spawn_process(struct mg_connection *conn, const char *prog,
 }
 #endif /* !NO_CGI */
 
-#if !defined(CIVET_QUICK_SHUTDOWN)
 static int set_non_blocking_mode(SOCKET sock)
 {
     unsigned long on = 1;
     return ioctlsocket(sock, FIONBIO, &on);
 }
-#endif
 
 #else
 static int mg_stat(struct mg_connection *conn, const char *path,
@@ -2608,7 +2606,6 @@ static pid_t spawn_process(struct mg_connection *conn, const char *prog,
 }
 #endif /* !NO_CGI */
 
-#if !defined(CIVET_QUICK_SHUTDOWN)
 static int set_non_blocking_mode(SOCKET sock)
 {
     int flags;
@@ -2622,7 +2619,6 @@ static int set_non_blocking_mode(SOCKET sock)
 
     return 0;
 }
-#endif
 #endif /* _WIN32 */
 
 /* Write data to the IO channel - opened file descriptor, socket or SSL
@@ -7673,6 +7669,8 @@ static void close_socket_gracefully(struct mg_connection *conn)
     }
 #endif
 
+    /* Send FIN to the client */
+    shutdown(socket_fd, SHUT_WR);
 #if !defined(CIVET_NO_EPOLL)
     struct mg_epoll_event_close_socket *data = mg_calloc(sizeof(*data), 1);
     if (data) {
@@ -7682,20 +7680,14 @@ static void close_socket_gracefully(struct mg_connection *conn)
         event.events = EPOLLONESHOT | EPOLLERR;
         event.data.ptr = data;
         if (connection_epoll_ctl(conn, &event) != -1) {
-            shutdown(socket_fd, SHUT_WR);
             conn->client.sock = INVALID_SOCKET;
             return;
         }
         mg_free(data);
     }
 #endif
-    conn->client.sock = INVALID_SOCKET;
-
-    /* Send FIN to the client */
-#if !defined(CIVET_QUICK_SHUTDOWN)
-    shutdown(socket_fd, SHUT_WR);
     set_non_blocking_mode(socket_fd);
-#endif
+    conn->client.sock = INVALID_SOCKET;
 
 #if defined(_WIN32)
     /* Read and discard pending incoming data. If we do not do that and close
