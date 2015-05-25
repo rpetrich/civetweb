@@ -160,8 +160,8 @@ int clock_gettime(int clk_id, struct timespec* t) {
 #define MAX_WORKER_THREADS (1024*64)
 #endif
 
-#ifndef MAX_ASSIST_THREADS
-#define MAX_ASSIST_THREADS 7
+#ifndef MAX_MASTER_THREADS
+#define MAX_MASTER_THREADS 8
 #endif
 
 #if defined(_WIN32) && !defined(__SYMBIAN32__) /* Windows specific */
@@ -791,7 +791,7 @@ enum {
     ACCESS_LOG_FILE, ENABLE_DIRECTORY_LISTING, ERROR_LOG_FILE,
     GLOBAL_PASSWORDS_FILE, INDEX_FILES, ENABLE_KEEP_ALIVE, ACCESS_CONTROL_LIST,
     EXTRA_MIME_TYPES, LISTENING_PORTS, DOCUMENT_ROOT, SSL_CERTIFICATE,
-    NUM_THREADS, NUM_ASSIST_THREADS, RUN_AS_USER, REWRITE, HIDE_FILES, REQUEST_TIMEOUT, IDLE_TIMEOUT,
+    NUM_THREADS, NUM_MASTER_THREADS, RUN_AS_USER, REWRITE, HIDE_FILES, REQUEST_TIMEOUT, IDLE_TIMEOUT,
     DECODE_URL,
 
 #if defined(USE_LUA)
@@ -835,7 +835,7 @@ static struct mg_option config_options[] = {
     {"document_root",               CONFIG_TYPE_DIRECTORY,     NULL},
     {"ssl_certificate",             CONFIG_TYPE_FILE,          NULL},
     {"num_threads",                 CONFIG_TYPE_NUMBER,        "50"},
-    {"num_assist_threads",          CONFIG_TYPE_NUMBER,        "0"},
+    {"num_master_threads",          CONFIG_TYPE_NUMBER,        "1"},
     {"run_as_user",                 CONFIG_TYPE_STRING,        NULL},
     {"url_rewrite_patterns",        CONFIG_TYPE_STRING,        NULL},
     {"hide_files_patterns",         CONFIG_TYPE_EXT_PATTERN,   NULL},
@@ -8909,10 +8909,10 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
     (void) signal(SIGPIPE, SIG_IGN);
 #endif /* !_WIN32 && !__SYMBIAN32__ */
 
-    masterthreadcount = atoi(ctx->config[NUM_ASSIST_THREADS]) + 1;
+    masterthreadcount = atoi(ctx->config[NUM_MASTER_THREADS]);
 
-    if (masterthreadcount > MAX_ASSIST_THREADS + 1) {
-        mg_cry(fc(ctx), "Too many assistant threads");
+    if (masterthreadcount > MAX_MASTER_THREADS) {
+        mg_cry(fc(ctx), "Too many master threads");
         free_context(ctx);
         return NULL;
     }
