@@ -906,6 +906,7 @@ struct mg_epoll_event_close_socket {
 
 struct mg_context {
     volatile int stop_flag;         /* Should we stop event loop */
+    volatile int live_sockets;      /* How many sockets are being processed */
     SSL_CTX *ssl_ctx;               /* SSL context */
     char *config[NUM_OPTIONS];      /* Civetweb configuration parameters */
     struct mg_callbacks callbacks;  /* User-defined callback function */
@@ -2687,9 +2688,6 @@ static int pull(FILE *fp, struct mg_connection *conn, char *buf, int len)
         } else {
             nread = (int)recv(conn->client.sock, buf, (size_t) len, 0);
         }
-        if (conn->ctx->stop_flag) {
-            return -1;
-        }
         if (nread >= 0) {
             return nread;
         }
@@ -2706,7 +2704,7 @@ static int pull_all(FILE *fp, struct mg_connection *conn, char *buf, int len)
 {
     int n, nread = 0;
 
-    while (len > 0 && conn->ctx->stop_flag == 0) {
+    while (len > 0) {
         n = pull(fp, conn, buf + nread, len);
         if (n < 0) {
             nread = n;  /* Propagate the error */
@@ -2903,7 +2901,7 @@ int mg_write(struct mg_connection *conn, const void *buf, size_t len)
                           (int64_t) allowed)) == allowed) {
             buf = (char *) buf + total;
             conn->last_throttle_bytes += total;
-            while (total < (int64_t) len && conn->ctx->stop_flag == 0) {
+            while (total < (int64_t) len) {
                 allowed = conn->throttle > (int64_t) len - total ?
                           (int64_t) len - total : conn->throttle;
                 if ((n = push(NULL, conn->client.sock, conn->ssl, (const char *) buf,
@@ -4653,8 +4651,7 @@ static int read_request(FILE *fp, struct mg_connection *conn,
     double request_timeout = conn->ctx->request_timeout;
 
     request_len = get_request_len(buf, *nread);
-    while ((conn->ctx->stop_flag == 0) &&
-           (*nread < bufsiz) &&
+    while ((*nread < bufsiz) &&
            (request_len == 0) &&
            ((mg_difftimespec(&last_action_time, &(conn->req_time)) <= request_timeout) || (request_timeout < 0)) &&
            ((n = pull(fp, conn, buf + *nread, bufsiz - *nread)) > 0)
@@ -5967,7 +5964,7 @@ static void read_websocket(struct mg_connection *conn, mg_websocket_data_handler
        callback, and waiting repeatedly until an error occurs. */
     /* TODO: Investigate if this next line is needed
     assert(conn->content_len == 0); */
-    while (!conn->ctx->stop_flag) {
+    for (;;) {
         header_len = 0;
         assert(conn->data_len >= conn->request_len);
         if ((body_len = conn->data_len - conn->request_len) >= 2) {
@@ -7706,6 +7703,7 @@ static void close_socket_gracefully(struct mg_connection *conn)
 
     /* Now we know that our FIN is ACK-ed, safe to close */
     closesocket(socket_fd);
+    mg_atomic_dec(&conn->ctx->live_sockets);
 }
 
 static void close_connection(struct mg_connection *conn)
@@ -7775,7 +7773,7 @@ void mg_close_connection(struct mg_connection *conn)
     if (conn->ctx->context_type == 2) {
         client_ctx = conn->ctx;
         /* client context: loops must end */
-        conn->ctx->stop_flag = 1;
+        mg_atomic_dec(&conn->ctx->live_sockets);
     }
 
 #ifndef NO_SSL
@@ -8198,7 +8196,7 @@ static int consume_socket(struct mg_context *ctx, struct mg_connection **cp)
     DEBUG_TRACE("%s", "going idle");
 
     /* If the queue is empty, wait. We're idle at this point. */
-    while (ctx->sq_head == ctx->sq_tail && ctx->stop_flag == 0) {
+    while (ctx->sq_head == ctx->sq_tail && ctx->live_sockets != 0) {
         pthread_cond_wait(&ctx->sq_full, &ctx->thread_mutex);
     }
 
@@ -8221,7 +8219,7 @@ static int consume_socket(struct mg_context *ctx, struct mg_connection **cp)
     (void) pthread_cond_signal(&ctx->sq_empty);
     (void) pthread_mutex_unlock(&ctx->thread_mutex);
 
-    return !ctx->stop_flag;
+    return ctx->live_sockets != 0;
 }
 
 static void *worker_thread_run(void *thread_func_param)
@@ -8239,7 +8237,7 @@ static void *worker_thread_run(void *thread_func_param)
 
     pthread_setspecific(sTlsKey, &tls);
 
-    /* Call consume_socket() even when ctx->stop_flag > 0, to let it
+    /* Call consume_socket() even when ctx->live_sockets == 0, to let it
        signal sq_empty condvar to wake up the master waiting in
        produce_socket() */
     while (consume_socket(ctx, &conn)) {
@@ -8284,8 +8282,7 @@ static void produce_socket(struct mg_context *ctx, struct mg_connection *sp)
     (void) pthread_mutex_lock(&ctx->thread_mutex);
 
     /* If the queue is full, wait */
-    while (ctx->stop_flag == 0 &&
-           ctx->sq_head - ctx->sq_tail >= (int) ARRAY_SIZE(ctx->queue)) {
+    while (ctx->sq_head - ctx->sq_tail >= (int) ARRAY_SIZE(ctx->queue)) {
         (void) pthread_cond_wait(&ctx->sq_empty, &ctx->thread_mutex);
     }
 
@@ -8349,6 +8346,7 @@ static void accept_new_connection(const struct socket *listener,
         if (conn == NULL) {
             mg_cry(fc(ctx), "%s", "Cannot create new connection struct, OOM");
         } else {
+            mg_atomic_inc(&ctx->live_sockets);
             conn->client = so;
             conn->conn_birth_time = time(NULL);
             conn->ctx = ctx;
@@ -8413,6 +8411,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
                 // Close file descriptors that have hung up or have an error
                 // Will be automatically removed from the epool file descriptor
                 closesocket(close_event->socket);
+                mg_atomic_dec(&ctx->live_sockets);
                 mg_free(close_event);
             }
             break;
@@ -8464,7 +8463,7 @@ static void poll_for_connections(struct mg_context *ctx)
     if (epoll_fd != -1) {
         for (;;) {
             count = epoll_wait(epoll_fd, events, sizeof(events) / sizeof(events[0]), 200);
-            if (ctx->stop_flag == 1) {
+            if (ctx->live_sockets == 0) {
                 break;
             }
             if (count == -1) {
@@ -8495,7 +8494,7 @@ static void poll_for_connections(struct mg_context *ctx)
                    (POLLRDNORM | POLLRDBAND)
                    Therefore, we're checking pfd[i].revents & POLLIN, not
                    pfd[i].revents == POLLIN. */
-                if (ctx->stop_flag == 0 && (pfd[i].revents & POLLIN)) {
+                if (pfd[i].revents & POLLIN) {
                     accept_new_connection(&ctx->listening_sockets[i], ctx);
                 }
             }
@@ -8766,6 +8765,7 @@ static void free_context(struct mg_context *ctx)
 
 void mg_stop(struct mg_context *ctx)
 {
+    mg_atomic_dec(&ctx->live_sockets);
     ctx->stop_flag = 1;
 
     /* Wait until mg_fini() stops */
@@ -8997,6 +8997,8 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
         return NULL;
     }
 #endif
+
+    ctx->live_sockets = 1;
 
     /* Context has been created - init user libraries */
     if (ctx->callbacks.init_context) {
