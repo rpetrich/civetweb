@@ -959,6 +959,7 @@ struct mg_context {
 struct mg_connection {
 #if !defined(CIVET_NO_EPOLL)
     struct mg_epoll_event_header event_header;
+    int was_epoll_scheduled;
 #endif
     struct mg_request_info request_info;
     struct mg_context *ctx;
@@ -7633,6 +7634,23 @@ static int set_sock_timeout(SOCKET sock, int milliseconds)
     return r1 || r2;
 }
 
+#if !defined(CIVET_NO_EPOLL)
+int connection_epoll_ctl(struct mg_connection *conn, struct epoll_event *event)
+{
+    int epoll_fd = conn->ctx->epoll_fd;
+    if (epoll_fd == -1) {
+        return -1;
+    }
+    int socket_fd = conn->client.sock;
+    if (conn->was_epoll_scheduled) {
+        return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, socket_fd, event);
+    } else {
+        // Set before scheduling, to avoid a data race
+        conn->was_epoll_scheduled = 1;
+        return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, event);
+    }
+}
+#endif
 
 static void close_socket_gracefully(struct mg_connection *conn)
 {
@@ -7656,22 +7674,19 @@ static void close_socket_gracefully(struct mg_connection *conn)
 #endif
 
 #if !defined(CIVET_NO_EPOLL)
-    int epoll_fd = conn->ctx->epoll_fd;
-    if (epoll_fd != -1) {
-        struct mg_epoll_event_close_socket *data = mg_calloc(sizeof(*data), 1);
-        if (data) {
-            data->header.type = EPOLL_DATA_TYPE_CLOSE_SOCKET;
-            data->socket = socket_fd;
-            struct epoll_event event;
-            event.events = EPOLLONESHOT | EPOLLERR;
-            event.data.ptr = data;
-            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &event) != -1) {
-                shutdown(socket_fd, SHUT_WR);
-                conn->client.sock = INVALID_SOCKET;
-                return;
-            }
-            mg_free(data);
+    struct mg_epoll_event_close_socket *data = mg_calloc(sizeof(*data), 1);
+    if (data) {
+        data->header.type = EPOLL_DATA_TYPE_CLOSE_SOCKET;
+        data->socket = socket_fd;
+        struct epoll_event event;
+        event.events = EPOLLONESHOT | EPOLLERR;
+        event.data.ptr = data;
+        if (connection_epoll_ctl(conn, &event) != -1) {
+            shutdown(socket_fd, SHUT_WR);
+            conn->client.sock = INVALID_SOCKET;
+            return;
         }
+        mg_free(data);
     }
 #endif
     conn->client.sock = INVALID_SOCKET;
@@ -7850,8 +7865,6 @@ static int getreq(struct mg_connection *conn, char *ebuf, size_t ebuf_len, int *
       ebuf[0] = '\0';
     }
     *err = 0;
-
-    reset_per_request_attributes(conn);
 
     /* Set the time the request was received. This value should be used for timeouts. */
     if (conn->ctx->request_timeout != -1) {
@@ -8161,13 +8174,13 @@ static void process_connection(struct mg_connection *conn)
         assert(conn->data_len <= MAX_REQUEST_SIZE);
 #if !defined(CIVET_NO_EPOLL)
         // Return the worker thread to the pool and have the main thread resume processing the keep alive
-        if (keep_alive && (get_request_len(conn->buf, conn->data_len) == 0)) {
-            int epoll_fd = conn->ctx->epoll_fd;
-            if (epoll_fd != -1) {
+        if (keep_alive) {
+            reset_per_request_attributes(conn);
+            if (get_request_len(conn->buf, conn->data_len) == 0) {
                 struct epoll_event event;
                 event.events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
                 event.data.ptr = conn;
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->client.sock, &event) != -1) {
+                if (connection_epoll_ctl(conn, &event) != -1) {
                     return;
                 }
             }
@@ -8366,14 +8379,11 @@ static void accept_new_connection(const struct socket *listener,
                ) {
 #if !defined(CIVET_NO_EPOLL)
                 conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
-                int epoll_fd = ctx->epoll_fd;
-                if (epoll_fd != -1) {
-                    struct epoll_event event;
-                    event.events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
-                    event.data.ptr = conn;
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listener->sock, &event) != -1) {
-                        return;
-                    }
+                struct epoll_event event;
+                event.events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
+                event.data.ptr = conn;
+                if (connection_epoll_ctl(conn, &event) != -1) {
+                    return;
                 }
 #endif
                 produce_socket(ctx, conn);
@@ -8386,25 +8396,6 @@ static void accept_new_connection(const struct socket *listener,
 }
 
 #if !defined(CIVET_NO_EPOLL)
-static int read_request_epoll(struct mg_connection *conn,
-                        char *buf, int bufsiz, int *nread)
-{
-    int request_len = -1;
-    int n = 0;
-
-    if ((conn->ctx->stop_flag == 0) &&
-           (*nread < bufsiz) &&
-           (request_len == 0) &&
-           ((n = pull(NULL, conn, buf + *nread, bufsiz - *nread)) > 0)
-          ) {
-        *nread += n;
-        assert(*nread <= bufsiz);
-        request_len = get_request_len(buf, *nread);
-    }
-
-    return (request_len <= 0 && n <= 0) ? -1 : request_len;
-}
-
 static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event)
 {
     struct mg_epoll_event_header *header = event->data.ptr;
@@ -8429,14 +8420,24 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
         case EPOLL_DATA_TYPE_READ_REQUEST: {
             struct mg_connection *conn = event->data.ptr;
             if (event->events & EPOLLIN) {
-                int request_size = read_request_epoll(conn, conn->buf, MAX_REQUEST_SIZE, &conn->data_len);
-                if (request_size > 0) {
-                    produce_socket(ctx, conn);
+                int data_len = conn->data_len;
+                int n = pull(NULL, conn, conn->buf + data_len, MAX_REQUEST_SIZE - data_len);
+                if (n < 0) {
+                    // Socket has an error, just tear it down
+                    close_connection(conn);
+                    mg_free(conn);
                 } else {
-                    // Ask for more data as it comes in
-                    event->events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
-                    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, conn->client.sock, event) == -1) {
-                        mg_cry(conn, "%s: epoll_ctl() failed: %s", __func__, strerror(ERRNO));
+                    data_len += n;
+                    conn->data_len = n;
+                    if ((get_request_len(conn->buf, data_len) != 0) || (data_len == MAX_REQUEST_SIZE) || (n == 0)) {
+                        // Both malformed (< 0) and completed (> 0) requests are processed in the worker thread
+                        produce_socket(ctx, conn);
+                    } else {
+                        // Ask for more data as it comes in
+                        event->events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
+                        if (connection_epoll_ctl(conn, event) == -1) {
+                            mg_cry(conn, "%s: epoll_ctl() failed: %s", __func__, strerror(ERRNO));
+                        }
                     }
                 }
             } else if (event->events & (EPOLLERR | EPOLLHUP)) {
