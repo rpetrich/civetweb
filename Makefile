@@ -60,7 +60,7 @@ BUILD_DIRS += $(BUILD_DIR)/test
 endif
 
 # only set main compile options if none were chosen
-CFLAGS += -Wall -Wextra -O2 -D$(TARGET_OS) -Iinclude $(COPT) -DUSE_STACK_SIZE=102400
+CFLAGS += -Wall -Wextra -Wshadow -Wformat-security -Winit-self -Wmissing-prototypes -O2 -D$(TARGET_OS) -Iinclude $(COPT) -DUSE_STACK_SIZE=102400
 
 LIBS = -lpthread -lm
 
@@ -91,12 +91,6 @@ endif
 
 ifdef WITH_WEBSOCKET
   CFLAGS += -DUSE_WEBSOCKET
-  ifdef WITH_LUA
-    CFLAGS += -DUSE_TIMERS
-    ifeq ($(TARGET_OS),LINUX)
-      LIBS += -lrt
-    endif
-  endif
 endif
 
 ifdef CONFIG_FILE
@@ -135,9 +129,9 @@ ifdef WITH_LUA_SHARED
   LIBS += -llua5.2
 endif
 
-ifneq (, $(findstring mingw32, $(shell gcc -dumpmachine)))
+ifneq (, $(findstring mingw32, $(shell $(CC) -dumpmachine)))
   BUILD_RESOURCES = $(BUILD_DIR)/$(WINDOWS_RESOURCES:.rc=.o)
-  LIBS := $(filter-out -lrt, $(LIBS)) -lws2_32 -lcomdlg32 -mwindows
+  LIBS += -lws2_32 -mwindows
   SHARED_LIB = dll
 else
   SHARED_LIB = so
