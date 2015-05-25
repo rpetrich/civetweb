@@ -937,9 +937,8 @@ struct mg_context {
     volatile int sq_tail;           /* Tail of the socket queue */
     pthread_cond_t sq_full;         /* Signaled when socket is produced */
     pthread_cond_t sq_empty;        /* Signaled when socket is consumed */
-    pthread_t masterthreadid;       /* The master thread ID */
-    int assistantthreadcount;       /* The amount of assistant threads. */
-    pthread_t *assistantthreadids;  /* The assistant thread IDs */
+    int masterthreadcount;          /* The amount of master threads. */
+    pthread_t *masterthreadids;     /* The master thread IDs */
     int workerthreadcount;          /* The amount of worker threads. */
     pthread_t *workerthreadids;     /* The worker thread IDs */
 
@@ -8096,8 +8095,8 @@ struct mg_connection *mg_connect_websocket_client(const char *host, int port, in
     memcpy(newctx, conn->ctx, sizeof(struct mg_context));
     newctx->user_data = user_data;
     newctx->context_type = 2; /* client context type */
-    newctx->assistantthreadcount = 1; /* no assistant threads will be created */
-    newctx->assistantthreadids = NULL;
+    newctx->masterthreadcount = 0; /* no master threads will be created */
+    newctx->masterthreadids = NULL;
     newctx->workerthreadcount = 1; /* one worker thread will be created */
     newctx->workerthreadids = (pthread_t*) mg_calloc(newctx->workerthreadcount, sizeof(pthread_t));
     conn->ctx = newctx;
@@ -8272,7 +8271,7 @@ static void *worker_thread_run(void *thread_func_param)
         process_connection(conn);
     }
 
-    /* Signal master that we're done with connection and exiting */
+    /* Signal that we're done processing connections and will exit */
     (void) pthread_mutex_lock(&ctx->thread_mutex);
     ctx->num_threads--;
     (void) pthread_cond_signal(&ctx->thread_cond);
@@ -8534,57 +8533,12 @@ static void poll_for_connections(struct mg_context *ctx)
     mg_free(pfd_backup);
 }
 
-static void assistant_thread_run(void *thread_func_param)
-{
-    struct mg_context *ctx = (struct mg_context *) thread_func_param;
-    struct mg_workerTLS tls;
-
-    tls.is_master = 1;
-    pthread_setspecific(sTlsKey, &tls);
-#if defined(_WIN32) && !defined(__SYMBIAN32__)
-    tls.pthread_cond_helper_mutex = CreateEvent(NULL, FALSE, FALSE, NULL);
-#endif
-
-    /* Accept connections */
-    poll_for_connections(ctx);
-
-    /* Signal master that we're done with connection and exiting */
-    (void) pthread_mutex_lock(&ctx->thread_mutex);
-    ctx->num_threads--;
-    (void) pthread_cond_signal(&ctx->thread_cond);
-    assert(ctx->num_threads >= 0);
-    (void) pthread_mutex_unlock(&ctx->thread_mutex);
-
-    pthread_setspecific(sTlsKey, NULL);
-#if defined(_WIN32) && !defined(__SYMBIAN32__)
-    CloseHandle(tls.pthread_cond_helper_mutex);
-#endif
-}
-
-/* Threads have different return types on Windows and Unix. */
-#ifdef _WIN32
-static unsigned __stdcall assistant_thread(void *thread_func_param)
-{
-    assistant_thread_run(thread_func_param);
-    return 0;
-}
-#else
-static void *assistant_thread(void *thread_func_param)
-{
-    assistant_thread_run(thread_func_param);
-    return NULL;
-}
-#endif /* _WIN32 */
-
 static void master_thread_run(void *thread_func_param)
 {
     struct mg_context *ctx = (struct mg_context *) thread_func_param;
     struct mg_workerTLS tls;
-    int i;
-    int workerthreadcount;
 
     mg_set_thread_name("master");
-    int assistantthreadcount;
 
     /* Increase priority of the master thread */
 #if defined(_WIN32)
@@ -8609,55 +8563,20 @@ static void master_thread_run(void *thread_func_param)
     tls.is_master = 1;
     pthread_setspecific(sTlsKey, &tls);
 
-    /* Start assistant threads */
-    for (i = 0; i < ctx->assistantthreadcount; i++) {
-        (void) pthread_mutex_lock(&ctx->thread_mutex);
-        ctx->num_threads++;
-        (void) pthread_mutex_unlock(&ctx->thread_mutex);
-        if (mg_start_thread_with_id(assistant_thread, ctx,
-                                    &ctx->assistantthreadids[i]) != 0) {
-            (void) pthread_mutex_lock(&ctx->thread_mutex);
-            ctx->num_threads--;
-            (void) pthread_mutex_unlock(&ctx->thread_mutex);
-            mg_cry(fc(ctx), "Cannot start assistant thread: %ld", (long) ERRNO);
-        }
-    }
-
     /* Accept connections */
     poll_for_connections(ctx);
-    DEBUG_TRACE("%s", "stopping workers");
 
-    /* Wakeup workers that are waiting for connections to handle. */
-    pthread_cond_broadcast(&ctx->sq_full);
-
-    /* Wait until all threads finish */
+    /* Signal that we're done processing connections and will exit */
     (void) pthread_mutex_lock(&ctx->thread_mutex);
-    while (ctx->num_threads > 0) {
-        (void) pthread_cond_wait(&ctx->thread_cond, &ctx->thread_mutex);
-    }
+    ctx->num_threads--;
+    (void) pthread_cond_signal(&ctx->thread_cond);
+    assert(ctx->num_threads >= 0);
     (void) pthread_mutex_unlock(&ctx->thread_mutex);
-
-    /* Join all assistant threads to avoid leaking threads. */
-    assistantthreadcount = ctx->assistantthreadcount;
-    for (i = 0; i < assistantthreadcount; i++) {
-        mg_join_thread(ctx->assistantthreadids[i]);
-    }
-
-    /* Join all worker threads to avoid leaking threads. */
-    workerthreadcount = ctx->workerthreadcount;
-    for (i = 0; i < workerthreadcount; i++) {
-        mg_join_thread(ctx->workerthreadids[i]);
-    }
 
 #if defined(_WIN32) && !defined(__SYMBIAN32__)
     CloseHandle(tls.pthread_cond_helper_mutex);
 #endif
     pthread_setspecific(sTlsKey, NULL);
-
-    /* Signal mg_stop() that we're done.
-       WARNING: This must be the very last thing this
-       thread does, as ctx becomes invalid after this line. */
-    ctx->stop_flag = 2;
 }
 
 /* Threads have different return types on Windows and Unix. */
@@ -8749,14 +8668,35 @@ static void free_context(struct mg_context *ctx)
 
 void mg_stop(struct mg_context *ctx)
 {
-    /* Stop listening immediately */
-    close_all_listening_sockets(ctx);
-
+    int i;
     /* Tell the threads to stop */
     ctx->stop_flag = 1;
 
-    /* Wait until master thread stops */
-    mg_join_thread(ctx->masterthreadid);
+    /* Stop listening immediately */
+    close_all_listening_sockets(ctx);
+
+    /* Wakeup workers that are waiting for connections to handle. */
+    pthread_cond_broadcast(&ctx->sq_full);
+
+    /* Wait until all threads finish */
+    (void) pthread_mutex_lock(&ctx->thread_mutex);
+    while (ctx->num_threads > 0) {
+        (void) pthread_cond_wait(&ctx->thread_cond, &ctx->thread_mutex);
+    }
+    (void) pthread_mutex_unlock(&ctx->thread_mutex);
+
+    /* Wait until master threads stop. */
+    int masterthreadcount = ctx->masterthreadcount;
+    for (i = 0; i < masterthreadcount; i++) {
+        mg_join_thread(ctx->masterthreadids[i]);
+    }
+
+    /* Wait until worker threads stop. */
+    int workerthreadcount = ctx->workerthreadcount;
+    for (i = 0; i < workerthreadcount; i++) {
+        mg_join_thread(ctx->workerthreadids[i]);
+    }
+
 #if !defined(CIVET_NO_EPOLL)
     if (ctx->epoll_fd != -1) {
         close(ctx->epoll_fd);
@@ -8817,7 +8757,7 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
     int workerthreadcount;
     void (*exit_callback)(const struct mg_context * ctx) = 0;
     int request_timeout, idle_timeout;
-    int assistantthreadcount;
+    int masterthreadcount;
 
 #if defined(_WIN32) && !defined(__SYMBIAN32__)
     WSADATA data;
@@ -8969,19 +8909,19 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
     (void) signal(SIGPIPE, SIG_IGN);
 #endif /* !_WIN32 && !__SYMBIAN32__ */
 
-    assistantthreadcount = atoi(ctx->config[NUM_ASSIST_THREADS]);
+    masterthreadcount = atoi(ctx->config[NUM_ASSIST_THREADS]) + 1;
 
-    if (assistantthreadcount > MAX_ASSIST_THREADS) {
+    if (masterthreadcount > MAX_ASSIST_THREADS + 1) {
         mg_cry(fc(ctx), "Too many assistant threads");
         free_context(ctx);
         return NULL;
     }
 
-    if (assistantthreadcount > 0) {
-        ctx->assistantthreadcount = assistantthreadcount;
-        ctx->assistantthreadids = (pthread_t *)mg_calloc(assistantthreadcount, sizeof(pthread_t));
-        if (ctx->assistantthreadids == NULL) {
-            mg_cry(fc(ctx), "Not enough memory for assistant thread ID array");
+    if (masterthreadcount > 0) {
+        ctx->masterthreadcount = masterthreadcount;
+        ctx->masterthreadids = (pthread_t *)mg_calloc(masterthreadcount, sizeof(pthread_t));
+        if (ctx->masterthreadids == NULL) {
+            mg_cry(fc(ctx), "Not enough memory for master thread ID array");
             free_context(ctx);
             return NULL;
         }
@@ -9023,8 +8963,19 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
     /* Server starts *now* */
     ctx->start_time = (unsigned long)time(NULL);
 
-    /* Start master (listening) thread */
-    mg_start_thread_with_id(master_thread, ctx, &ctx->masterthreadid);
+    /* Start master (listening) threads */
+    for (i = 0; i < ctx->masterthreadcount; i++) {
+        (void) pthread_mutex_lock(&ctx->thread_mutex);
+        ctx->num_threads++;
+        (void) pthread_mutex_unlock(&ctx->thread_mutex);
+        if (mg_start_thread_with_id(master_thread, ctx,
+                                    &ctx->masterthreadids[i]) != 0) {
+            (void) pthread_mutex_lock(&ctx->thread_mutex);
+            ctx->num_threads--;
+            (void) pthread_mutex_unlock(&ctx->thread_mutex);
+            mg_cry(fc(ctx), "Cannot start master thread: %ld", (long) ERRNO);
+        }
+    }
 
     /* Start worker threads */
     for (i = 0; i < workerthreadcount; i++) {
