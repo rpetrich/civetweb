@@ -7090,6 +7090,7 @@ static void close_all_listening_sockets(struct mg_context *ctx)
         if (sock != INVALID_SOCKET) {
             ctx->listening_sockets[i].socket.sock = INVALID_SOCKET;
             closesocket(sock);
+            mg_atomic_dec(&ctx->live_sockets);
         }
     }
 }
@@ -7264,6 +7265,7 @@ static int set_ports_option(struct mg_context *ctx)
             ctx->listening_ports = portPtr;
             ctx->listening_ports[ctx->num_listening_sockets] = ntohs(usa.sin.sin_port);
             ctx->num_listening_sockets++;
+            mg_atomic_inc(&ctx->live_sockets);
         }
     }
 
@@ -8607,9 +8609,6 @@ static void master_thread_run(void *thread_func_param)
     tls.is_master = 1;
     pthread_setspecific(sTlsKey, &tls);
 
-    /* Server starts *now* */
-    ctx->start_time = (unsigned long)time(NULL);
-
     /* Start assistant threads */
     for (i = 0; i < ctx->assistantthreadcount; i++) {
         (void) pthread_mutex_lock(&ctx->thread_mutex);
@@ -8649,19 +8648,6 @@ static void master_thread_run(void *thread_func_param)
     for (i = 0; i < workerthreadcount; i++) {
         mg_join_thread(ctx->workerthreadids[i]);
     }
-
-#if !defined(CIVET_NO_EPOLL)
-    if (ctx->epoll_fd != -1) {
-        close(ctx->epoll_fd);
-    }
-#endif
-
-#if !defined(NO_SSL)
-    if (ctx->ssl_ctx != NULL) {
-        uninitialize_ssl(ctx);
-    }
-#endif
-    DEBUG_TRACE("%s", "exiting");
 
 #if defined(_WIN32) && !defined(__SYMBIAN32__)
     CloseHandle(tls.pthread_cond_helper_mutex);
@@ -8767,14 +8753,23 @@ void mg_stop(struct mg_context *ctx)
     close_all_listening_sockets(ctx);
 
     /* Tell the threads to stop */
-    mg_atomic_dec(&ctx->live_sockets);
     ctx->stop_flag = 1;
 
-    /* Wait until mg_fini() stops */
-    while (ctx->stop_flag != 2) {
-        (void) mg_sleep(10);
-    }
+    /* Wait until master thread stops */
     mg_join_thread(ctx->masterthreadid);
+#if !defined(CIVET_NO_EPOLL)
+    if (ctx->epoll_fd != -1) {
+        close(ctx->epoll_fd);
+    }
+#endif
+
+#if !defined(NO_SSL)
+    if (ctx->ssl_ctx != NULL) {
+        uninitialize_ssl(ctx);
+    }
+#endif
+    DEBUG_TRACE("%s", "exiting");
+
     free_context(ctx);
 
 #if defined(_WIN32) && !defined(__SYMBIAN32__)
@@ -9018,14 +9013,15 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
     }
 #endif
 
-    ctx->live_sockets = 1;
-
     /* Context has been created - init user libraries */
     if (ctx->callbacks.init_context) {
         ctx->callbacks.init_context(ctx);
     }
     ctx->callbacks.exit_context = exit_callback;
     ctx->context_type = 1; /* server context */
+
+    /* Server starts *now* */
+    ctx->start_time = (unsigned long)time(NULL);
 
     /* Start master (listening) thread */
     mg_start_thread_with_id(master_thread, ctx, &ctx->masterthreadid);
