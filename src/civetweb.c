@@ -160,6 +160,10 @@ int clock_gettime(int clk_id, struct timespec* t) {
 #define MAX_WORKER_THREADS (1024*64)
 #endif
 
+#ifndef MAX_ASSIST_THREADS
+#define MAX_ASSIST_THREADS 7
+#endif
+
 #if defined(_WIN32) && !defined(__SYMBIAN32__) /* Windows specific */
 #include <windows.h>
 #include <winsock2.h>    /* DTL add for SO_EXCLUSIVE */
@@ -787,7 +791,7 @@ enum {
     ACCESS_LOG_FILE, ENABLE_DIRECTORY_LISTING, ERROR_LOG_FILE,
     GLOBAL_PASSWORDS_FILE, INDEX_FILES, ENABLE_KEEP_ALIVE, ACCESS_CONTROL_LIST,
     EXTRA_MIME_TYPES, LISTENING_PORTS, DOCUMENT_ROOT, SSL_CERTIFICATE,
-    NUM_THREADS, RUN_AS_USER, REWRITE, HIDE_FILES, REQUEST_TIMEOUT, IDLE_TIMEOUT,
+    NUM_THREADS, NUM_ASSIST_THREADS, RUN_AS_USER, REWRITE, HIDE_FILES, REQUEST_TIMEOUT, IDLE_TIMEOUT,
     DECODE_URL,
 
 #if defined(USE_LUA)
@@ -831,6 +835,7 @@ static struct mg_option config_options[] = {
     {"document_root",               CONFIG_TYPE_DIRECTORY,     NULL},
     {"ssl_certificate",             CONFIG_TYPE_FILE,          NULL},
     {"num_threads",                 CONFIG_TYPE_NUMBER,        "50"},
+    {"num_assist_threads",          CONFIG_TYPE_NUMBER,        "0"},
     {"run_as_user",                 CONFIG_TYPE_STRING,        NULL},
     {"url_rewrite_patterns",        CONFIG_TYPE_STRING,        NULL},
     {"hide_files_patterns",         CONFIG_TYPE_EXT_PATTERN,   NULL},
@@ -924,6 +929,8 @@ struct mg_context {
     pthread_cond_t sq_full;         /* Signaled when socket is produced */
     pthread_cond_t sq_empty;        /* Signaled when socket is consumed */
     pthread_t masterthreadid;       /* The master thread ID */
+    int assistantthreadcount;       /* The amount of assistant threads. */
+    pthread_t *assistantthreadids;  /* The assistant thread IDs */
     int workerthreadcount;          /* The amount of worker threads. */
     pthread_t *workerthreadids;     /* The worker thread IDs */
 
@@ -8054,6 +8061,8 @@ struct mg_connection *mg_connect_websocket_client(const char *host, int port, in
     memcpy(newctx, conn->ctx, sizeof(struct mg_context));
     newctx->user_data = user_data;
     newctx->context_type = 2; /* client context type */
+    newctx->assistantthreadcount = 1; /* no assistant threads will be created */
+    newctx->assistantthreadids = NULL;
     newctx->workerthreadcount = 1; /* one worker thread will be created */
     newctx->workerthreadids = (pthread_t*) mg_calloc(newctx->workerthreadcount, sizeof(pthread_t));
     conn->ctx = newctx;
@@ -8490,6 +8499,48 @@ static void poll_for_connections(struct mg_context *ctx)
     mg_free(pfd);
 }
 
+static void assistant_thread_run(void *thread_func_param)
+{
+    struct mg_context *ctx = (struct mg_context *) thread_func_param;
+    struct mg_workerTLS tls;
+
+    tls.is_master = 1;
+    pthread_setspecific(sTlsKey, &tls);
+#if defined(_WIN32) && !defined(__SYMBIAN32__)
+    tls.pthread_cond_helper_mutex = CreateEvent(NULL, FALSE, FALSE, NULL);
+#endif
+
+    /* Accept connections */
+    poll_for_connections(ctx);
+
+    /* Signal master that we're done with connection and exiting */
+    (void) pthread_mutex_lock(&ctx->thread_mutex);
+    ctx->num_threads--;
+    (void) pthread_cond_signal(&ctx->thread_cond);
+    assert(ctx->num_threads >= 0);
+    (void) pthread_mutex_unlock(&ctx->thread_mutex);
+
+    pthread_setspecific(sTlsKey, NULL);
+#if defined(_WIN32) && !defined(__SYMBIAN32__)
+    CloseHandle(tls.pthread_cond_helper_mutex);
+#endif
+}
+
+/* Threads have different return types on Windows and Unix. */
+#ifdef _WIN32
+static unsigned __stdcall assistant_thread(void *thread_func_param)
+{
+    assistant_thread_run(thread_func_param);
+    return 0;
+}
+#else
+static void *assistant_thread(void *thread_func_param)
+{
+    assistant_thread_run(thread_func_param);
+    return NULL;
+}
+#endif /* _WIN32 */
+
 static void master_thread_run(void *thread_func_param)
 {
     struct mg_context *ctx = (struct mg_context *) thread_func_param;
@@ -8501,6 +8552,7 @@ static void master_thread_run(void *thread_func_param)
 #endif
 
     mg_set_thread_name("master");
+    int assistantthreadcount;
 
     /* Increase priority of the master thread */
 #if defined(_WIN32)
@@ -8552,6 +8604,19 @@ static void master_thread_run(void *thread_func_param)
         ctx->epoll_fd = -1;
     }
 #endif
+    /* Start assistant threads */
+    for (i = 0; i < ctx->assistantthreadcount; i++) {
+        (void) pthread_mutex_lock(&ctx->thread_mutex);
+        ctx->num_threads++;
+        (void) pthread_mutex_unlock(&ctx->thread_mutex);
+        if (mg_start_thread_with_id(assistant_thread, ctx,
+                                    &ctx->assistantthreadids[i]) != 0) {
+            (void) pthread_mutex_lock(&ctx->thread_mutex);
+            ctx->num_threads--;
+            (void) pthread_mutex_unlock(&ctx->thread_mutex);
+            mg_cry(fc(ctx), "Cannot start assistant thread: %ld", (long) ERRNO);
+        }
+    }
 
     /* Accept connections */
     poll_for_connections(ctx);
@@ -8569,6 +8634,12 @@ static void master_thread_run(void *thread_func_param)
         (void) pthread_cond_wait(&ctx->thread_cond, &ctx->thread_mutex);
     }
     (void) pthread_mutex_unlock(&ctx->thread_mutex);
+
+    /* Join all assistant threads to avoid leaking threads. */
+    assistantthreadcount = ctx->assistantthreadcount;
+    for (i = 0; i < assistantthreadcount; i++) {
+        mg_join_thread(ctx->assistantthreadids[i]);
+    }
 
     /* Join all worker threads to avoid leaking threads. */
     workerthreadcount = ctx->workerthreadcount;
@@ -8744,6 +8815,7 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
     int workerthreadcount;
     void (*exit_callback)(const struct mg_context * ctx) = 0;
     int request_timeout, idle_timeout;
+    int assistantthreadcount;
 
 #if defined(_WIN32) && !defined(__SYMBIAN32__)
     WSADATA data;
@@ -8876,6 +8948,24 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
        won't kill the whole process. */
     (void) signal(SIGPIPE, SIG_IGN);
 #endif /* !_WIN32 && !__SYMBIAN32__ */
+
+    assistantthreadcount = atoi(ctx->config[NUM_ASSIST_THREADS]);
+
+    if (assistantthreadcount > MAX_ASSIST_THREADS) {
+        mg_cry(fc(ctx), "Too many assistant threads");
+        free_context(ctx);
+        return NULL;
+    }
+
+    if (assistantthreadcount > 0) {
+        ctx->assistantthreadcount = assistantthreadcount;
+        ctx->assistantthreadids = (pthread_t *)mg_calloc(assistantthreadcount, sizeof(pthread_t));
+        if (ctx->assistantthreadids == NULL) {
+            mg_cry(fc(ctx), "Not enough memory for assistant thread ID array");
+            free_context(ctx);
+            return NULL;
+        }
+    }
 
     workerthreadcount = atoi(ctx->config[NUM_THREADS]);
 
