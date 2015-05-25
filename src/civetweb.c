@@ -896,11 +896,15 @@ struct mg_epoll_event_header {
 };
 struct mg_epoll_event_accept_socket {
     struct mg_epoll_event_header header;
-    struct socket *socket;
+    struct socket socket;
 };
 struct mg_epoll_event_close_socket {
     struct mg_epoll_event_header header;
     SOCKET socket;
+};
+#else
+struct mg_accept_socket {
+    struct socket socket;
 };
 #endif
 
@@ -916,7 +920,11 @@ struct mg_context {
     int sock_timeout;               /* OS-level timeout to set on the socket */
     double request_timeout;         /* Request-level timeout from start to finish */
 
-    struct socket *listening_sockets;
+#if !defined(CIVET_NO_EPOLL)
+    struct mg_epoll_event_accept_socket *listening_sockets;
+#else
+    struct mg_accept_socket *listening_sockets;
+#endif
     in_port_t *listening_ports;
     int num_listening_sockets;
 
@@ -1351,7 +1359,7 @@ size_t mg_get_ports(const struct mg_context *ctx, size_t size, int* ports, int* 
     size_t i;
     for (i = 0; i < size && i < (size_t)ctx->num_listening_sockets; i++)
     {
-        ssl[i] = ctx->listening_sockets[i].is_ssl;
+        ssl[i] = ctx->listening_sockets[i].socket.is_ssl;
         ports[i] = ctx->listening_ports[i];
     }
     return i;
@@ -6455,11 +6463,13 @@ int mg_upload(struct mg_connection *conn, const char *destination_dir)
 
 static int get_first_ssl_listener_index(const struct mg_context *ctx)
 {
-    int i, idx = -1;
-    for (i = 0; idx == -1 && i < ctx->num_listening_sockets; i++) {
-        idx = ctx->listening_sockets[i].is_ssl ? i : -1;
+    int i;
+    for (i = 0; i < ctx->num_listening_sockets; i++) {
+        if (ctx->listening_sockets[i].socket.is_ssl) {
+            return i;
+        }
     }
-    return idx;
+    return -1;
 }
 
 static void redirect_to_https_port(struct mg_connection *conn, int ssl_index)
@@ -6488,7 +6498,7 @@ static void redirect_to_https_port(struct mg_connection *conn, int ssl_index)
     /* Send host, port, uri and (if it exists) ?query_string */
     mg_printf(conn, "HTTP/1.1 302 Found\r\nLocation: https://%s:%d%s%s%s\r\n\r\n",
               host,
-              (int) ntohs(conn->ctx->listening_sockets[ssl_index].lsa.sin.sin_port),
+              (int) ntohs(conn->ctx->listening_sockets[ssl_index].socket.lsa.sin.sin_port),
               conn->request_info.uri,
               (conn->request_info.query_string == NULL) ? "" : "?",
               (conn->request_info.query_string == NULL) ? "" : conn->request_info.query_string
@@ -7074,11 +7084,19 @@ static void handle_file_based_request(struct mg_connection *conn, const char *pa
 
 static void close_all_listening_sockets(struct mg_context *ctx)
 {
-    int i;
+    int i, sock;
     for (i = 0; i < ctx->num_listening_sockets; i++) {
-        closesocket(ctx->listening_sockets[i].sock);
-        ctx->listening_sockets[i].sock = INVALID_SOCKET;
+        sock = ctx->listening_sockets[i].socket.sock;
+        if (sock != INVALID_SOCKET) {
+            ctx->listening_sockets[i].socket.sock = INVALID_SOCKET;
+            closesocket(sock);
+        }
     }
+}
+
+static void free_all_listening_sockets(struct mg_context *ctx)
+{
+    close_all_listening_sockets(ctx);
     mg_free(ctx->listening_sockets);
     ctx->listening_sockets = NULL;
     mg_free(ctx->listening_ports);
@@ -7170,7 +7188,12 @@ static int set_ports_option(struct mg_context *ctx)
     int off = 0;
 #endif
     struct vec vec;
-    struct socket so, *ptr;
+    struct socket so;
+#if !defined(CIVET_NO_EPOLL)
+    struct mg_epoll_event_accept_socket *ptr;
+#else
+    struct mg_accept_socket *ptr;
+#endif
 
     in_port_t *portPtr;
     union usa usa;
@@ -7215,7 +7238,7 @@ static int set_ports_option(struct mg_context *ctx)
                 so.sock = INVALID_SOCKET;
             }
             success = 0;
-        } else if ((ptr = (struct socket *) mg_realloc(ctx->listening_sockets,
+        } else if ((ptr = mg_realloc(ctx->listening_sockets,
                           (ctx->num_listening_sockets + 1) *
                           sizeof(ctx->listening_sockets[0]))) == NULL) {
             closesocket(so.sock);
@@ -7234,7 +7257,10 @@ static int set_ports_option(struct mg_context *ctx)
             set_close_on_exec(so.sock, fc(ctx));
 #endif
             ctx->listening_sockets = ptr;
-            ctx->listening_sockets[ctx->num_listening_sockets] = so;
+#if !defined(CIVET_NO_EPOLL)
+            ctx->listening_sockets[ctx->num_listening_sockets].header.type = EPOLL_DATA_TYPE_ACCEPT_SOCKET;
+#endif
+            ctx->listening_sockets[ctx->num_listening_sockets].socket = so;
             ctx->listening_ports = portPtr;
             ctx->listening_ports[ctx->num_listening_sockets] = ntohs(usa.sin.sin_port);
             ctx->num_listening_sockets++;
@@ -7242,7 +7268,7 @@ static int set_ports_option(struct mg_context *ctx)
     }
 
     if (!success) {
-        close_all_listening_sockets(ctx);
+        free_all_listening_sockets(ctx);
     }
 
     return success;
@@ -8401,7 +8427,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
         case EPOLL_DATA_TYPE_ACCEPT_SOCKET: {
             struct mg_epoll_event_accept_socket *accept_event = event->data.ptr;
             if (event->events & EPOLLIN) {
-                accept_new_connection(accept_event->socket, ctx);
+                accept_new_connection(&accept_event->socket, ctx);
             }
             break;
         }
@@ -8480,27 +8506,30 @@ static void poll_for_connections(struct mg_context *ctx)
     }
 #endif
     /* Allocate memory for the listening sockets, and start the server */
-    struct pollfd *pfd = (struct pollfd *) mg_calloc(ctx->num_listening_sockets, sizeof(pfd[0]));
+    int num_listening_sockets = ctx->num_listening_sockets;
+    struct pollfd *pfd = (struct pollfd *) mg_calloc(num_listening_sockets, sizeof(*pfd));
+    struct pollfd *pfd_backup = (struct pollfd *) mg_calloc(num_listening_sockets, sizeof(*pfd));
+    for (i = 0; i < ctx->num_listening_sockets; i++) {
+        pfd_backup[i].fd = ctx->listening_sockets[i].socket.sock;
+        pfd_backup[i].events = POLLIN;
+    }
     while (pfd != NULL && ctx->stop_flag == 0) {
-        for (i = 0; i < ctx->num_listening_sockets; i++) {
-            pfd[i].fd = ctx->listening_sockets[i].sock;
-            pfd[i].events = POLLIN;
-        }
-
-        if (poll(pfd, ctx->num_listening_sockets, 200) > 0) {
-            for (i = 0; i < ctx->num_listening_sockets; i++) {
+        memcpy(pfd, pfd_backup, sizeof(*pfd) * num_listening_sockets);
+        if (poll(pfd, num_listening_sockets, 200) > 0) {
+            for (i = 0; i < num_listening_sockets; i++) {
                 /* NOTE(lsm): on QNX, poll() returns POLLRDNORM after the
                    successful poll, and POLLIN is defined as
                    (POLLRDNORM | POLLRDBAND)
                    Therefore, we're checking pfd[i].revents & POLLIN, not
                    pfd[i].revents == POLLIN. */
                 if (pfd[i].revents & POLLIN) {
-                    accept_new_connection(&ctx->listening_sockets[i], ctx);
+                    accept_new_connection(&ctx->listening_sockets[i].socket, ctx);
                 }
             }
         }
     }
     mg_free(pfd);
+    mg_free(pfd_backup);
 }
 
 static void assistant_thread_run(void *thread_func_param)
@@ -8551,9 +8580,6 @@ static void master_thread_run(void *thread_func_param)
     struct mg_workerTLS tls;
     int i;
     int workerthreadcount;
-#if !defined(CIVET_NO_EPOLL)
-    struct mg_epoll_event_accept_socket *accept_data;
-#endif
 
     mg_set_thread_name("master");
     int assistantthreadcount;
@@ -8584,30 +8610,6 @@ static void master_thread_run(void *thread_func_param)
     /* Server starts *now* */
     ctx->start_time = (unsigned long)time(NULL);
 
-    /* Setup epoll, if available */
-#if !defined(CIVET_NO_EPOLL)
-    accept_data = mg_calloc(sizeof(*accept_data), ctx->num_listening_sockets);
-    if (accept_data != NULL) {
-        ctx->epoll_fd = epoll_create(ctx->num_listening_sockets);
-        if (ctx->epoll_fd != -1) {
-            struct epoll_event event;
-            for (i = 0; i < ctx->num_listening_sockets; i++) {
-                accept_data[i].header.type = EPOLL_DATA_TYPE_ACCEPT_SOCKET;
-                accept_data[i].socket = &ctx->listening_sockets[i];
-                event.events = EPOLLIN;
-                event.data.ptr = &accept_data[i];
-                if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->listening_sockets[i].sock, &event) == -1) {
-                    // Fallback to polling
-                    close(ctx->epoll_fd);
-                    ctx->epoll_fd = -1;
-                    break;
-                }
-            }
-        }
-    } else {
-        ctx->epoll_fd = -1;
-    }
-#endif
     /* Start assistant threads */
     for (i = 0; i < ctx->assistantthreadcount; i++) {
         (void) pthread_mutex_lock(&ctx->thread_mutex);
@@ -8625,9 +8627,6 @@ static void master_thread_run(void *thread_func_param)
     /* Accept connections */
     poll_for_connections(ctx);
     DEBUG_TRACE("%s", "stopping workers");
-
-    /* Stop signal received: somebody called mg_stop. Quit. */
-    close_all_listening_sockets(ctx);
 
     /* Wakeup workers that are waiting for connections to handle. */
     pthread_cond_broadcast(&ctx->sq_full);
@@ -8654,9 +8653,6 @@ static void master_thread_run(void *thread_func_param)
 #if !defined(CIVET_NO_EPOLL)
     if (ctx->epoll_fd != -1) {
         close(ctx->epoll_fd);
-    }
-    if (accept_data) {
-        mg_free(accept_data);
     }
 #endif
 
@@ -8704,6 +8700,8 @@ static void free_context(struct mg_context *ctx)
     if (ctx->callbacks.exit_context) {
         ctx->callbacks.exit_context(ctx);
     }
+
+    free_all_listening_sockets(ctx);
 
     /* All threads exited, no sync is needed. Destroy thread mutex and condvars */
     (void) pthread_mutex_destroy(&ctx->thread_mutex);
@@ -8765,6 +8763,10 @@ static void free_context(struct mg_context *ctx)
 
 void mg_stop(struct mg_context *ctx)
 {
+    /* Stop listening immediately */
+    close_all_listening_sockets(ctx);
+
+    /* Tell the threads to stop */
     mg_atomic_dec(&ctx->live_sockets);
     ctx->stop_flag = 1;
 
@@ -8947,6 +8949,24 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
         free_context(ctx);
         return NULL;
     }
+
+    /* Setup epoll, if available */
+#if !defined(CIVET_NO_EPOLL)
+    ctx->epoll_fd = epoll_create(ctx->num_listening_sockets);
+    if (ctx->epoll_fd != -1) {
+        struct epoll_event event;
+        for (i = 0; i < ctx->num_listening_sockets; i++) {
+            event.events = EPOLLIN;
+            event.data.ptr = &ctx->listening_sockets[i];
+            if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->listening_sockets[i].socket.sock, &event) == -1) {
+                // Fallback to polling
+                close(ctx->epoll_fd);
+                ctx->epoll_fd = -1;
+                break;
+            }
+        }
+    }
+#endif
 
 #if !defined(_WIN32) && !defined(__SYMBIAN32__)
     /* Ignore SIGPIPE signal, so if browser cancels the request, it
