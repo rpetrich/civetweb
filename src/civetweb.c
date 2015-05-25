@@ -871,6 +871,7 @@ struct socket {
 	unsigned char ssl_redir; /* Is port supposed to redirect everything to SSL
 	                          * port */
 	unsigned char is_non_blocking; /* Is currently in non-blocking mode */
+	unsigned char is_no_delay; /* Has Nagle's algorithm suppressed */
 };
 
 /* NOTE(lsm): this enum shoulds be in sync with the config_options below. */
@@ -2993,6 +2994,18 @@ static int mg_set_non_blocking(struct socket *s, int enabled)
 	int result = set_non_blocking_mode(s->sock, enabled);
 	if (result == 0) {
 		s->is_non_blocking = enabled;
+	}
+	return result;
+}
+
+static int mg_set_no_delay(struct socket *s, int enabled)
+{
+	if (s->is_no_delay == enabled)
+		return 0;
+	int flag = 1;
+	int result = setsockopt(s->sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int));
+	if (result == 0) {
+		s->is_no_delay = enabled;
 	}
 	return result;
 }
@@ -8330,6 +8343,7 @@ static int set_ports_option(struct mg_context *ctx)
 				success = 0;
 			} else {
 				so.is_non_blocking = 0;
+				so.is_no_delay = 0;
 				mg_set_non_blocking(&so, 1);
 #if !defined(CIVET_NO_CLOEXEC)
 				set_close_on_exec(so.sock, fc(ctx));
@@ -8920,16 +8934,15 @@ static void close_connection(struct mg_connection *conn)
 
 void mg_flush_response(struct mg_connection *conn)
 {
-	int sock = conn->client.sock;
-	if (sock != INVALID_SOCKET) {
+	if (conn->client.sock != INVALID_SOCKET) {
 		if (should_keep_alive(conn)) {
-			// Activating Nagle's algorithm implicitly flushes the send buffer
-			int flag = 1;
-			if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int)) != -1) {
+			/* Activating Nagle's algorithm implicitly flushes the send buffer */
+			if (mg_set_no_delay(&conn->client, 1) == 0) {
 				return;
 			}
 		}
-		// And if the client connection doesn't support keep alive, the connection must be closed
+		/* And if the client connection doesn't support keep alive,
+		 * the connection must be closed to do a flush */
 		close_connection(conn);
 	}
 }
@@ -9639,6 +9652,7 @@ static void accept_new_connection(const struct socket *listener,
 #else
 			so.is_non_blocking = listener->is_non_blocking;
 #endif
+			so.is_no_delay = 0;
 			conn->conn_birth_time = time(NULL);
 			conn->client = so;
 			conn->ctx = ctx;
