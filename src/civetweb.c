@@ -174,7 +174,89 @@ static int clock_gettime(int clk_id, struct timespec *t)
 #include <sys/epoll.h>
 #endif
 #else
+#if defined(__MACH__) && !defined(CIVET_NO_EPOLL)
+#include <sys/types.h>
+#include <sys/event.h>
+#include <sys/time.h>
+
+typedef union epoll_data {
+	void    *ptr;
+	int      fd;
+	uint32_t u32;
+	uint64_t u64;
+} epoll_data_t;
+
+struct epoll_event {
+	uint32_t     events; /* Epoll events */
+	epoll_data_t data;   /* User data variable */
+};
+
+#define EPOLLHUP EV_EOF
+#define EPOLLERR EV_ERROR
+/* Rely on EV_DISABLE AND EV_ADD not conflicting with other EV_* defines, don't use */
+#define EPOLLIN  EV_ADD
+#define EPOLLOUT EV_DISABLE
+#define EPOLL_CTL_ADD EV_ENABLE
+#define EPOLL_CTL_MOD EV_ENABLE
+#define EPOLL_CTL_DEL EV_DELETE
+#define EPOLLONESHOT EV_ONESHOT
+
+static int epoll_create(int hint)
+{
+	(void)hint;
+	return kqueue();
+}
+
+static int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
+{
+	int events = event->events;
+	void *ptr = event->data.ptr;
+	int flags = (events & ~(EV_ADD | EV_DISABLE)) 
+	          | ((op == EPOLL_CTL_DEL) ? EV_DELETE : EV_ADD);
+	struct kevent change[2];
+	int i = 0;
+	if ((events & EPOLLIN) || ((events & EPOLLOUT) == 0)) {
+		EV_SET(&change[i++], fd, EVFILT_READ, flags, 0, 0, ptr);
+	}
+	if (events & EPOLLOUT) {
+		EV_SET(&change[i++], fd, EVFILT_WRITE, flags, 0, 0, ptr);
+	}
+	return kevent(epfd, change, i, NULL, 0, NULL);
+}
+
+static int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
+{
+	struct kevent changes[16];
+	struct timespec timespec;
+	const struct timespec *timeout_ptr;
+	if (timeout < 0) {
+		timeout_ptr = NULL;
+	} else {
+		timespec.tv_sec = timeout / 1000;
+		timespec.tv_nsec = (timeout % 1000) * 1000000;
+		timeout_ptr = &timespec;
+	}
+	int result = kevent(epfd, NULL, 0, changes, maxevents > 16 ? 16 : maxevents, timeout_ptr);
+	int i;
+	for (i = 0; i < result; i++) {
+		events[i].events = 0;
+		if (changes[i].flags & EV_EOF) {
+			events[i].events |= EPOLLHUP;
+		}
+		if (changes[i].flags & EV_ERROR) {
+			events[i].events |= EPOLLERR;
+		}
+		if (changes[i].flags & EVFILT_READ) {
+			events[i].events |= EPOLLIN;
+		}
+		events[i].data.ptr = changes[i].udata;
+	}
+	return result;
+}
+
+#else
 #define CIVET_NO_EPOLL
+#endif
 #endif
 
 #ifndef MAX_WORKER_THREADS
@@ -8872,7 +8954,7 @@ static void close_socket_gracefully(struct mg_connection *conn)
 		data->header.type = EPOLL_DATA_TYPE_CLOSE_SOCKET;
 		data->socket = socket_fd;
 		struct epoll_event event;
-		event.events = EPOLLONESHOT | EPOLLERR;
+		event.events = EPOLLONESHOT;
 		event.data.ptr = data;
 		if (connection_epoll_ctl(conn, &event) != -1) {
 			conn->client.sock = INVALID_SOCKET;
@@ -9445,7 +9527,7 @@ static void process_connection(struct mg_connection *conn)
 					}
 					if (get_request_len(conn->buf, data_len) == 0) {
 						struct epoll_event event;
-						event.events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
+						event.events = EPOLLONESHOT | EPOLLIN;
 						event.data.ptr = conn;
 						if (connection_epoll_ctl(conn, &event) != -1) {
 							return;
@@ -9695,7 +9777,7 @@ static void accept_new_connection(const struct socket *listener,
 #if !defined(CIVET_NO_EPOLL)
 				conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
 				struct epoll_event event;
-				event.events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
+				event.events = EPOLLONESHOT | EPOLLIN;
 				event.data.ptr = conn;
 				if (connection_epoll_ctl(conn, &event) != -1) {
 					return;
