@@ -119,7 +119,7 @@ mg_static_assert(sizeof(void *) >= sizeof(int), "data type size check");
 #include <assert.h>
 
 /* clock_gettime is not implemented on OSX */
-int clock_gettime(int clk_id, struct timespec *t)
+static int clock_gettime(int clk_id, struct timespec *t)
 {
 	if (clk_id == CLOCK_REALTIME) {
 		struct timeval now;
