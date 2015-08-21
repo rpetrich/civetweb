@@ -9744,7 +9744,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 					mg_free(conn);
 				} else {
 					data_len += n;
-					conn->data_len = n;
+					conn->data_len = data_len;
 					if ((get_request_len(conn->buf, data_len) != 0) || (data_len == MAX_REQUEST_SIZE) || (n == 0)) {
 						// Both malformed (< 0) and completed (> 0) requests are processed in the worker thread
 						produce_socket(ctx, conn);
