@@ -9647,8 +9647,7 @@ static void produce_socket(struct mg_context *ctx, struct mg_connection *cp)
 	(void)pthread_mutex_lock(&ctx->thread_mutex);
 
 	/* If the queue is full, wait */
-	while (ctx->stop_flag == 0 &&
-	       ctx->sq_head - ctx->sq_tail >= QUEUE_SIZE(ctx)) {
+	while (ctx->sq_head - ctx->sq_tail >= QUEUE_SIZE(ctx)) {
 		(void)pthread_cond_wait(&ctx->sq_empty, &ctx->thread_mutex);
 	}
 
@@ -9677,10 +9676,6 @@ static void accept_new_connection(const struct socket *listener,
 
 	if (!listener)
 		return;
-	if (ctx->stop_flag) {
-		// Shutting down, don't accept this connection
-		return;
-	}
 
 	if ((so.sock = accept(listener->sock, &so.rsa.sa, &len)) ==
 	    INVALID_SOCKET) {
