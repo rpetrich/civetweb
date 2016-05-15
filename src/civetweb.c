@@ -8947,20 +8947,24 @@ static void close_socket_gracefully(struct mg_connection *conn)
 #endif
 
 	/* Send FIN to the client */
+#if defined(CIVET_NO_EPOLL)
 	shutdown(socket_fd, SHUT_WR);
-#if !defined(CIVET_NO_EPOLL)
-	struct mg_epoll_event_close_socket *data = mg_calloc(sizeof(*data), 1);
-	if (data) {
-		data->header.type = EPOLL_DATA_TYPE_CLOSE_SOCKET;
-		data->socket = socket_fd;
-		struct epoll_event event;
-		event.events = EPOLLONESHOT;
-		event.data.ptr = data;
-		if (connection_epoll_ctl(conn, &event) != -1) {
-			conn->client.sock = INVALID_SOCKET;
-			return;
+#else
+	int err = shutdown(socket_fd, SHUT_RDWR);
+	if (err == 0 || errno != ENOTCONN) {
+		struct mg_epoll_event_close_socket *data = mg_calloc(sizeof(*data), 1);
+		if (data) {
+			data->header.type = EPOLL_DATA_TYPE_CLOSE_SOCKET;
+			data->socket = socket_fd;
+			struct epoll_event event;
+			event.events = EPOLLONESHOT;
+			event.data.ptr = data;
+			if (connection_epoll_ctl(conn, &event) != -1) {
+				conn->client.sock = INVALID_SOCKET;
+				return;
+			}
+			mg_free(data);
 		}
-		mg_free(data);
 	}
 #endif
 	mg_set_non_blocking(&conn->client, 1);
