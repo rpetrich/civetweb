@@ -3378,6 +3378,7 @@ int mg_write(struct mg_connection *conn, const void *buf, size_t len)
 {
 	time_t now;
 	int64_t n, total, allowed;
+	int err;
 
 	if (conn == NULL) {
 		return 0;
@@ -3424,15 +3425,15 @@ int mg_write(struct mg_connection *conn, const void *buf, size_t len)
 		             conn->ssl,
 		             (const char *)buf,
 		             (int64_t)len);
-		if ((total == 0) && conn->client.is_non_blocking) {
-			int err = ERRNO;
+		if ((total < (int64_t)len) && conn->client.is_non_blocking) {
+			err = ERRNO;
 			if ((err == EWOULDBLOCK) || (err == ENOBUFS) || (err == EAGAIN)) {
 				mg_set_non_blocking(&conn->client, 0);
-				total = push(NULL,
+				total += push(NULL,
 				             conn->client.sock,
 				             conn->ssl,
-				             (const char *)buf,
-				             (int64_t)len);
+				             (const char *)buf + total,
+				             (int64_t)(len - total));
 			}
 		}
 	}
