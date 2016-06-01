@@ -10028,6 +10028,11 @@ static void free_context(struct mg_context *ctx)
 		mg_free(ctx->workerthreadids);
 	}
 
+	/* Deallocate master thread ID array */
+	if (ctx->masterthreadids != NULL) {
+		mg_free(ctx->masterthreadids);
+	}
+
 	/* Deallocate the tls variable */
 	if (mg_atomic_dec(&sTlsInit) == 0) {
 		pthread_key_delete(sTlsKey);
