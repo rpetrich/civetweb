@@ -406,6 +406,26 @@ CIVETWEB_API int mg_write(struct mg_connection *, const void *buf, size_t len);
 /* Flush data to the client, potentially closes the connection if keep alive isn't supported */
 CIVETWEB_API void mg_flush_response(struct mg_connection *);
 
+/* Send data to the client asynchronously. This function can be called multiple times per connection to sequentually
+   send chunks of large data. These calls must be finished with a single call of mg_flush_response_non_blocking. All the
+   calls must be made from the same data-providing thread. This function takes ownership of the data, so the data will
+   be freed after being sent. */
+CIVETWEB_API void mg_write_non_blocking(struct mg_connection *conn, void *buf);
+
+/* Flush data provided by the mg_write_non_blocking call(s) to the client, potentially closes the connection if keep
+   alive isn't supported */
+CIVETWEB_API void mg_flush_response_non_blocking(struct mg_connection *);
+
+/* Send data to the client asynchronously. It is most suitable for small data. This function takes ownership of the
+   data, so the data will be freed after being sent. */
+CIVETWEB_API void mg_write_and_flush_response_non_blocking(struct mg_connection *conn, void *buf);
+
+/* Associate the connection with the functions, which will be used to access the data, determine its size and free it.
+   This function must be called before mg_write_non_blocking and mg_write_and_flush_response_non_blocking from the same
+   data-providing thread. */
+CIVETWEB_API void mg_register_data_handlers(struct mg_connection *conn, const char* (*get_response_chunk_data)(void *),
+    size_t (*get_response_chunk_size)(void *), void (*free_response_chunk)(void *));
+
 /* Close the connection early */
 CIVETWEB_API void mg_finish(struct mg_connection *);
 

@@ -168,6 +168,7 @@ static int clock_gettime(int clk_id, struct timespec *t)
 #include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdatomic.h>
 
 #ifdef __linux__
 #if !defined(CIVET_NO_EPOLL)
@@ -1092,7 +1093,8 @@ struct mg_request_handler_info {
 enum {
 	EPOLL_DATA_TYPE_ACCEPT_SOCKET,
 	EPOLL_DATA_TYPE_CLOSE_SOCKET,
-	EPOLL_DATA_TYPE_READ_REQUEST,
+    EPOLL_DATA_TYPE_READ_REQUEST,
+    EPOLL_DATA_TYPE_WRITE_RESPONSE,
 };
 struct mg_epoll_event_header {
 	int type;
@@ -1167,6 +1169,27 @@ struct mg_context {
 #endif
 };
 
+#if !defined(CIVET_NO_EPOLL)
+struct response_chunk_node {
+    void *response_chunk;
+    size_t num_response_chunk_bytes_sent;
+    atomic_uintptr_t next; // Thread-safe pointer to the next node of the list
+    // This flag is used by both the data-providing thread and the data-sending thread to determine, which of them
+    // encountered this node, when it was the last one in the list.
+    atomic_flag is_end_detected;
+};
+
+static struct response_chunk_node *create_response_chunk_node(void *response_chunk)
+{
+    struct response_chunk_node *node = mg_malloc(sizeof(struct response_chunk_node));
+    node->response_chunk = response_chunk;
+    node->num_response_chunk_bytes_sent = 0;
+    node->next = (uintptr_t)NULL;
+    atomic_flag_clear(&node->is_end_detected);
+    return node;
+}
+#endif
+
 struct mg_connection {
 #if !defined(CIVET_NO_EPOLL)
 	struct mg_epoll_event_header event_header;
@@ -1203,10 +1226,26 @@ struct mg_connection {
 	                              * atomic transmissions for websockets */
 #endif
 #if defined(USE_LUA) && defined(USE_WEBSOCKET)
-	void *lua_websocket_state; /* Lua_State for a websocket connection */
+	void *lua_websocket_state;   /* Lua_State for a websocket connection */
 #endif
 	char buf[MAX_REQUEST_SIZE];
+
+#if !defined(CIVET_NO_EPOLL)
+    struct response_chunk_node *response_chunk_head_node;
+    struct response_chunk_node *response_chunk_tail_node;
+    struct response_chunk_node *currently_sent_response_chunk_node;
+
+    const char* (*get_response_chunk_data)(void *response_chunk);
+    size_t (*get_response_chunk_size)(void *response_chunk);
+    void (*free_response_chunk)(void *response_chunk);
+#endif
 };
+
+#if !defined(CIVET_NO_EPOLL)
+// This is the indicator to show that all the data that need to be sent have been provided, no more is expected.
+static struct response_chunk_node response_chunk_nodes_end;
+static struct response_chunk_node *RESPONSE_CHUNK_NODES_END = &response_chunk_nodes_end;
+#endif
 
 static pthread_key_t sTlsKey; /* Thread local storage index */
 static int sTlsInit = 0;
@@ -3111,7 +3150,7 @@ push(FILE *fp, SOCKET sock, SSL *ssl, const char *buf, int64_t len)
 			n = SSL_write(ssl, buf + sent, k);
 		} else
 #endif
-		    if (fp != NULL) {
+		if (fp != NULL) {
 			n = (int)fwrite(buf + sent, 1, (size_t)k, fp);
 			if (ferror(fp))
 				n = -1;
@@ -8866,6 +8905,16 @@ static void reset_per_request_attributes(struct mg_connection *conn)
 	conn->request_info.num_headers = 0;
 	conn->data_len = 0;
 	conn->chunk_remainder = 0;
+#if !defined(CIVET_NO_EPOLL)
+    struct response_chunk_node *node, *next_node;
+    for (node = conn->response_chunk_head_node; node != NULL; node = next_node) {
+	    next_node = (struct response_chunk_node *)node->next;
+	    mg_free(node);
+	}
+    conn->response_chunk_head_node = NULL;
+    conn->response_chunk_tail_node = NULL;
+    conn->currently_sent_response_chunk_node = NULL;
+#endif
 }
 
 static int set_sock_timeout(SOCKET sock, int milliseconds)
@@ -8917,6 +8966,14 @@ static int connection_epoll_ctl(struct mg_connection *conn, struct epoll_event *
 		conn->was_epoll_scheduled = 1;
 		return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, event);
 	}
+}
+
+static int schedule_epoll_event_for_connection(struct mg_connection *conn, uint32_t events)
+{
+    struct epoll_event event;
+    event.events = events | EPOLLONESHOT | EPOLLERR;
+    event.data.ptr = conn;
+    return connection_epoll_ctl(conn, &event);
 }
 #endif
 
@@ -9031,18 +9088,128 @@ static void close_connection(struct mg_connection *conn)
 
 void mg_flush_response(struct mg_connection *conn)
 {
-	if (conn->client.sock != INVALID_SOCKET) {
-		if (should_keep_alive(conn)) {
-			/* Activating Nagle's algorithm implicitly flushes the send buffer */
-			if (mg_set_no_delay(&conn->client, 1) == 0) {
-				return;
-			}
-		}
-		/* And if the client connection doesn't support keep alive,
-		 * the connection must be closed to do a flush */
-		close_connection(conn);
-	}
+    if (conn->client.sock != INVALID_SOCKET) {
+        if (should_keep_alive(conn)) {
+            /* Activating Nagle's algorithm implicitly flushes the send buffer */
+            if (mg_set_no_delay(&conn->client, 1) == 0) {
+                return;
+            }
+        }
+        /* And if the client connection doesn't support keep alive,
+         * the connection must be closed to do a flush */
+        close_connection(conn);
+    }
 }
+
+#if !defined(CIVET_NO_EPOLL)
+void mg_write_non_blocking(struct mg_connection *conn, void *buf)
+{
+    if (conn != NULL) {
+        int epoll_fd = conn->ctx->epoll_fd;
+        if (epoll_fd != -1) {
+            size_t size = (*conn->get_response_chunk_size)(buf);
+            if (size > 0) { // Make sure we are actually provided with some data
+                if (conn->client.sock != INVALID_SOCKET) {
+                    struct response_chunk_node *new_tail_node = create_response_chunk_node(buf);
+                    conn->response_chunk_tail_node->next = (uintptr_t)new_tail_node;
+                    conn->response_chunk_tail_node = new_tail_node;
+                    if (conn->response_chunk_head_node == NULL) {
+                        conn->response_chunk_head_node = conn->response_chunk_tail_node;
+                        conn->currently_sent_response_chunk_node = conn->response_chunk_tail_node;
+                        mg_set_non_blocking(&conn->client, 1);
+                        conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
+                    }
+                    if (!atomic_flag_test_and_set(&conn->response_chunk_tail_node->is_end_detected)) {
+                        return;
+                    }
+                    if (schedule_epoll_event_for_connection(conn, EPOLLOUT) != -1) {
+                        return;
+                    }
+                    conn->client.sock = INVALID_SOCKET;
+                }
+                (*conn->free_response_chunk)(buf);
+            }
+        }
+    }
+}
+
+void mg_flush_response_non_blocking(struct mg_connection *conn)
+{
+    if (conn != NULL) {
+        int epoll_fd = conn->ctx->epoll_fd;
+        if (epoll_fd != -1) {
+            if (conn->response_chunk_head_node == NULL) {
+                return;
+            }
+            conn->response_chunk_tail_node->next = (uintptr_t)RESPONSE_CHUNK_NODES_END;
+            if (!atomic_flag_test_and_set(&conn->response_chunk_tail_node->is_end_detected)) {
+                return;
+            }
+            if (schedule_epoll_event_for_connection(conn, EPOLLOUT) != -1) {
+                return;
+            }
+            close_connection(conn);
+            mg_free(conn);
+        }
+    }
+}
+
+void mg_write_and_flush_response_non_blocking(struct mg_connection *conn, void *buf)
+{
+    if (conn != NULL) {
+        int epoll_fd = conn->ctx->epoll_fd;
+        if (epoll_fd != -1) {
+            size_t size = (*conn->get_response_chunk_size)(buf);
+            if (size > 0) { // Make sure we are actually provided with some data
+                const char *data = (*conn->get_response_chunk_data)(buf);
+                mg_set_non_blocking(&conn->client, 1);
+                // First try to send the the data w/o scheduling a epoll event. If the data are short enough, it will be
+                // more efficient.
+                ssize_t sent_count = send(conn->client.sock, data, size, MSG_NOSIGNAL);
+                if (sent_count == -1) {
+                    (*conn->free_response_chunk)(buf);
+                    close_connection(conn);
+                    mg_free(conn);
+                    return;
+                }
+                if ((size_t)sent_count == size) { // We are lucky, we managed to send everything at once w/o epoll.
+                    (*conn->free_response_chunk)(buf);
+                    if (should_keep_alive(conn)) {
+                        reset_per_request_attributes(conn);
+                        if (schedule_epoll_event_for_connection(conn, EPOLLIN) != -1) {
+                            return;
+                        }
+                    }
+                    close_connection(conn);
+                    mg_free(conn);
+                    return;
+                }
+                // Data were only partially sent, so we have no choice, but schedule a epoll event to send remaining data
+                conn->response_chunk_tail_node = create_response_chunk_node(buf);
+                conn->response_chunk_tail_node->num_response_chunk_bytes_sent = sent_count;
+                conn->response_chunk_tail_node->next = (uintptr_t)RESPONSE_CHUNK_NODES_END;
+                conn->response_chunk_head_node = conn->response_chunk_tail_node;
+                conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
+                if (schedule_epoll_event_for_connection(conn, EPOLLOUT) != -1) {
+                    return;
+                }
+                (*conn->free_response_chunk)(buf);
+                close_connection(conn);
+                mg_free(conn);
+            }
+        }
+    }
+}
+
+void mg_register_data_handlers(struct mg_connection *conn, const char* (*get_response_chunk_data)(void *),
+    size_t (*get_response_chunk_size)(void *), void (*free_response_chunk)(void *))
+{
+    conn->get_response_chunk_data = get_response_chunk_data;
+    conn->get_response_chunk_size = get_response_chunk_size;
+    conn->free_response_chunk = free_response_chunk;
+
+}
+#endif
 
 void mg_finish(struct mg_connection *conn)
 {
@@ -9108,6 +9275,11 @@ struct mg_connection *mg_connect_client(
 		socklen_t len = sizeof(struct sockaddr);
 		conn->ctx = &fake_ctx;
 		conn->client.sock = sock;
+#if !defined(CIVET_NO_EPOLL)
+        conn->response_chunk_head_node = NULL;
+        conn->response_chunk_tail_node = NULL;
+        conn->currently_sent_response_chunk_node = NULL;
+#endif
 		if (getsockname(sock, &conn->client.rsa.sa, &len) != 0) {
 			mg_cry(conn,
 			       "%s: getsockname() failed: %s",
@@ -9530,10 +9702,7 @@ static void process_connection(struct mg_connection *conn)
 						conn->data_len = data_len;
 					}
 					if (get_request_len(conn->buf, data_len) == 0) {
-						struct epoll_event event;
-						event.events = EPOLLONESHOT | EPOLLIN;
-						event.data.ptr = conn;
-						if (connection_epoll_ctl(conn, &event) != -1) {
+						if (schedule_epoll_event_for_connection(conn, EPOLLIN) != -1) {
 							return;
 						}
 					}
@@ -9774,11 +9943,11 @@ static void accept_new_connection(const struct socket *listener,
 			   ) {
 				mg_atomic_inc(&ctx->live_sockets);
 #if !defined(CIVET_NO_EPOLL)
+			    conn->response_chunk_head_node = NULL;
+			    conn->response_chunk_tail_node = NULL;
+			    conn->currently_sent_response_chunk_node = NULL;
 				conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
-				struct epoll_event event;
-				event.events = EPOLLONESHOT | EPOLLIN;
-				event.data.ptr = conn;
-				if (connection_epoll_ctl(conn, &event) != -1) {
+				if (schedule_epoll_event_for_connection(conn, EPOLLIN) != -1) {
 					return;
 				}
 #endif
@@ -9790,6 +9959,7 @@ static void accept_new_connection(const struct socket *listener,
 		}
 	}
 }
+
 #if !defined(CIVET_NO_EPOLL)
 static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event)
 {
@@ -9842,6 +10012,68 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 				close_connection(conn);
 				mg_free(conn);
 			}
+			break;
+		}
+		case EPOLL_DATA_TYPE_WRITE_RESPONSE: {
+            struct mg_connection *conn = event->data.ptr;
+            struct response_chunk_node *node = conn->currently_sent_response_chunk_node;
+            if (event->events & EPOLLOUT) {
+                size_t size = (*conn->get_response_chunk_size)(node->response_chunk) - node->num_response_chunk_bytes_sent;
+                const char *data = (*conn->get_response_chunk_data)(node) + node->num_response_chunk_bytes_sent;
+                ssize_t sent_count = send(conn->client.sock, data, size, MSG_NOSIGNAL);
+                if (sent_count != -1) {
+                    if ((size_t)sent_count == size) {
+                        (*conn->free_response_chunk)(node->response_chunk);
+                        struct response_chunk_node *next_node = (struct response_chunk_node *)node->next;
+                        if (next_node == RESPONSE_CHUNK_NODES_END) {
+                            if (should_keep_alive(conn)) {
+                                reset_per_request_attributes(conn);
+                                conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
+                                event->events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
+                                if (connection_epoll_ctl(conn, event) != -1) {
+                                    break;
+                                }
+                            }
+                            close_connection(conn);
+                            mg_free(conn);
+                            break;
+                        } else if (next_node == NULL) {
+                            if (!atomic_flag_test_and_set(&node->is_end_detected)) {
+                                break;
+                            }
+                            node = (struct response_chunk_node *)node->next;
+                        } else {
+                            node = next_node;
+                        }
+                        conn->currently_sent_response_chunk_node = node;
+                    } else {
+                        node->num_response_chunk_bytes_sent += sent_count;
+                    }
+                    event->events = EPOLLONESHOT | EPOLLOUT | EPOLLERR;
+                    if (connection_epoll_ctl(conn, event) != -1) {
+                        break;
+                    }
+                }
+            } else if (!(event->events & (EPOLLERR | EPOLLHUP))) {
+                break; //DO NOTHING...................................
+            }
+		    conn->client.sock = INVALID_SOCKET;
+		    for (;;) {
+		        (*conn->free_response_chunk)(node->response_chunk);
+		        struct response_chunk_node *next_node = (struct response_chunk_node *)node->next;
+		        if (next_node == RESPONSE_CHUNK_NODES_END) {
+		            close_connection(conn);
+		            mg_free(conn);
+		            break;
+		        } else if (next_node == NULL) {
+		            if (!atomic_flag_test_and_set(&node->is_end_detected)) {
+		                break;
+		            }
+		            node = (struct response_chunk_node *)node->next;
+		        } else {
+		            node = next_node;
+		        }
+		    }
 		}
 	}
 }
