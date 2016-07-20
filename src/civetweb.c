@@ -9092,8 +9092,7 @@ struct mg_connection *mg_connect_client(
 
 	if ((sock = conn2(&fake_ctx, host, port, use_ssl, ebuf, ebuf_len)) ==
 	    INVALID_SOCKET) {
-	} else if ((conn = (struct mg_connection *)mg_calloc(
-	                1, sizeof(*conn) + MAX_REQUEST_SIZE)) == NULL) {
+	} else if ((conn = (struct mg_connection *)mg_calloc(1, sizeof(*conn))) == NULL) {
 		snprintf(ebuf, ebuf_len, "calloc(): %s", strerror(ERRNO));
 		closesocket(sock);
 #ifndef NO_SSL
