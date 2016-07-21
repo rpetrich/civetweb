@@ -1179,12 +1179,13 @@ struct response_chunk_node {
     atomic_flag is_end_detected;
 };
 
-static struct response_chunk_node *create_response_chunk_node(void *response_chunk)
+static struct response_chunk_node *create_response_chunk_node(void *response_chunk, size_t num_response_chunk_bytes_sent,
+    struct response_chunk_node *next)
 {
     struct response_chunk_node *node = mg_malloc(sizeof(struct response_chunk_node));
     node->response_chunk = response_chunk;
-    node->num_response_chunk_bytes_sent = 0;
-    node->next = (uintptr_t)NULL;
+    node->num_response_chunk_bytes_sent = num_response_chunk_bytes_sent;
+    node->next = (uintptr_t)next;
     atomic_flag_clear(&node->is_end_detected);
     return node;
 }
@@ -1231,8 +1232,13 @@ struct mg_connection {
 	char buf[MAX_REQUEST_SIZE];
 
 #if !defined(CIVET_NO_EPOLL)
+	// Singly-linked list of response chunks
+	// Pointer to the first node of the list
     struct response_chunk_node *response_chunk_head_node;
+    // Pointer to the last node of the list. It's used only by the data-providing thread to make consecutive calls more
+    // efficient.
     struct response_chunk_node *response_chunk_tail_node;
+    // Pointer to the node, whose data is currently being sent.
     struct response_chunk_node *currently_sent_response_chunk_node;
 
     const char* (*get_response_chunk_data)(void *response_chunk);
@@ -9109,16 +9115,17 @@ void mg_write_non_blocking(struct mg_connection *conn, void *buf)
         if (epoll_fd != -1) {
             size_t size = (*conn->get_response_chunk_size)(buf);
             if (size > 0) { // Make sure we are actually provided with some data
-                if (conn->client.sock != INVALID_SOCKET) {
-                    struct response_chunk_node *new_tail_node = create_response_chunk_node(buf);
-                    conn->response_chunk_tail_node->next = (uintptr_t)new_tail_node;
-                    conn->response_chunk_tail_node = new_tail_node;
+                if (conn->client.sock != INVALID_SOCKET) { // The function is called first time for the current response
+                    struct response_chunk_node *new_node = create_response_chunk_node(buf, 0, NULL);
                     if (conn->response_chunk_head_node == NULL) {
-                        conn->response_chunk_head_node = conn->response_chunk_tail_node;
-                        conn->currently_sent_response_chunk_node = conn->response_chunk_tail_node;
+                        conn->response_chunk_head_node = new_node;
+                        conn->currently_sent_response_chunk_node = new_node;
                         mg_set_non_blocking(&conn->client, 1);
                         conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
+                    } else { // Consecutive calls of this function for the current response
+                        conn->response_chunk_tail_node->next = (uintptr_t)new_node;
                     }
+                    conn->response_chunk_tail_node = new_node;
                     if (!atomic_flag_test_and_set(&conn->response_chunk_tail_node->is_end_detected)) {
                         return;
                     }
@@ -9185,10 +9192,9 @@ void mg_write_and_flush_response_non_blocking(struct mg_connection *conn, void *
                     return;
                 }
                 // Data were only partially sent, so we have no choice, but schedule a epoll event to send remaining data
-                conn->response_chunk_tail_node = create_response_chunk_node(buf);
-                conn->response_chunk_tail_node->num_response_chunk_bytes_sent = sent_count;
-                conn->response_chunk_tail_node->next = (uintptr_t)RESPONSE_CHUNK_NODES_END;
-                conn->response_chunk_head_node = conn->response_chunk_tail_node;
+                struct response_chunk_node *new_node = create_response_chunk_node(buf, sent_count, RESPONSE_CHUNK_NODES_END);
+                conn->response_chunk_head_node = new_node;
+                conn->currently_sent_response_chunk_node = new_node;
                 conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
                 if (schedule_epoll_event_for_connection(conn, EPOLLOUT) != -1) {
                     return;
