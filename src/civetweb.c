@@ -1185,7 +1185,7 @@ static struct response_chunk_node *create_response_chunk_node(void *response_chu
     struct response_chunk_node *node = mg_malloc(sizeof(struct response_chunk_node));
     node->response_chunk = response_chunk;
     node->num_response_chunk_bytes_sent = num_response_chunk_bytes_sent;
-    node->next = (uintptr_t)next;
+    atomic_store(&node->next, (uintptr_t)next);
     atomic_flag_clear(&node->is_end_detected);
     return node;
 }
@@ -8914,7 +8914,7 @@ static void reset_per_request_attributes(struct mg_connection *conn)
 #if !defined(CIVET_NO_EPOLL)
     struct response_chunk_node *node, *next_node;
     for (node = conn->response_chunk_head_node; node != NULL; node = next_node) {
-	    next_node = (struct response_chunk_node *)node->next;
+	    next_node = (struct response_chunk_node *)atomic_load(&node->next);
 	    mg_free(node);
 	}
     conn->response_chunk_head_node = NULL;
@@ -9123,7 +9123,7 @@ void mg_write_non_blocking(struct mg_connection *conn, void *buf)
                         mg_set_non_blocking(&conn->client, 1);
                         conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
                     } else { // Consecutive calls of this function for the current response
-                        conn->response_chunk_tail_node->next = (uintptr_t)new_node;
+                        atomic_store(&conn->response_chunk_tail_node->next, (uintptr_t)new_node);
                     }
                     conn->response_chunk_tail_node = new_node;
                     if (!atomic_flag_test_and_set(&conn->response_chunk_tail_node->is_end_detected)) {
@@ -9148,7 +9148,7 @@ void mg_flush_response_non_blocking(struct mg_connection *conn)
             if (conn->response_chunk_head_node == NULL) {
                 return;
             }
-            conn->response_chunk_tail_node->next = (uintptr_t)RESPONSE_CHUNK_NODES_END;
+            atomic_store(&conn->response_chunk_tail_node->next, (uintptr_t)RESPONSE_CHUNK_NODES_END);
             if (!atomic_flag_test_and_set(&conn->response_chunk_tail_node->is_end_detected)) {
                 return;
             }
@@ -10030,7 +10030,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
                 if (sent_count != -1) {
                     if ((size_t)sent_count == size) {
                         (*conn->free_response_chunk)(node->response_chunk);
-                        struct response_chunk_node *next_node = (struct response_chunk_node *)node->next;
+                        struct response_chunk_node *next_node = (struct response_chunk_node *)atomic_load(&node->next);
                         if (next_node == RESPONSE_CHUNK_NODES_END) {
                             if (should_keep_alive(conn)) {
                                 reset_per_request_attributes(conn);
@@ -10047,7 +10047,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
                             if (!atomic_flag_test_and_set(&node->is_end_detected)) {
                                 break;
                             }
-                            node = (struct response_chunk_node *)node->next;
+                            node = (struct response_chunk_node *)atomic_load(&node->next);
                         } else {
                             node = next_node;
                         }
@@ -10066,7 +10066,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 		    conn->client.sock = INVALID_SOCKET;
 		    for (;;) {
 		        (*conn->free_response_chunk)(node->response_chunk);
-		        struct response_chunk_node *next_node = (struct response_chunk_node *)node->next;
+		        struct response_chunk_node *next_node = (struct response_chunk_node *)atomic_load(&node->next);
 		        if (next_node == RESPONSE_CHUNK_NODES_END) {
 		            close_connection(conn);
 		            mg_free(conn);
@@ -10075,7 +10075,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 		            if (!atomic_flag_test_and_set(&node->is_end_detected)) {
 		                break;
 		            }
-		            node = (struct response_chunk_node *)node->next;
+		            node = (struct response_chunk_node *)atomic_load(&node->next);
 		        } else {
 		            node = next_node;
 		        }
