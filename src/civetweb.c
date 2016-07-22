@@ -1092,7 +1092,8 @@ struct mg_request_handler_info {
 enum {
 	EPOLL_DATA_TYPE_ACCEPT_SOCKET,
 	EPOLL_DATA_TYPE_CLOSE_SOCKET,
-	EPOLL_DATA_TYPE_READ_REQUEST,
+    EPOLL_DATA_TYPE_READ_REQUEST,
+    EPOLL_DATA_TYPE_WRITE_RESPONSE,
 };
 struct mg_epoll_event_header {
 	int type;
@@ -1203,9 +1204,20 @@ struct mg_connection {
 	                              * atomic transmissions for websockets */
 #endif
 #if defined(USE_LUA) && defined(USE_WEBSOCKET)
-	void *lua_websocket_state; /* Lua_State for a websocket connection */
+	void *lua_websocket_state;   /* Lua_State for a websocket connection */
 #endif
 	char buf[MAX_REQUEST_SIZE];
+
+#if !defined(CIVET_NO_EPOLL)
+	struct
+	{
+        const void* buf;
+        size_t size;
+        size_t sent_count;
+        void (*callback)(void *, char);
+        void *callback_context;
+	} response;
+#endif
 };
 
 static pthread_key_t sTlsKey; /* Thread local storage index */
@@ -3111,7 +3123,7 @@ push(FILE *fp, SOCKET sock, SSL *ssl, const char *buf, int64_t len)
 			n = SSL_write(ssl, buf + sent, k);
 		} else
 #endif
-		    if (fp != NULL) {
+		if (fp != NULL) {
 			n = (int)fwrite(buf + sent, 1, (size_t)k, fp);
 			if (ferror(fp))
 				n = -1;
@@ -8903,20 +8915,29 @@ static int set_sock_timeout(SOCKET sock, int milliseconds)
 }
 
 #if !defined(CIVET_NO_EPOLL)
-static int connection_epoll_ctl(struct mg_connection *conn, struct epoll_event *event)
+static int schedule_event_for_epoll_op(struct mg_connection *conn, uint32_t events, struct epoll_event *e_event)
 {
 	int epoll_fd = conn->ctx->epoll_fd;
 	if (epoll_fd == -1) {
 		return -1;
 	}
-	int socket_fd = conn->client.sock;
+	// EPOLLERR is always reported, so we don't need to specify it here, but, because of a bug in some old Linux versions
+	// it wasn't the case, let's do it anyway, just in case.
+    e_event->events = events | EPOLLONESHOT | EPOLLERR;
 	if (conn->was_epoll_scheduled) {
-		return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, socket_fd, event);
+		return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->client.sock, e_event);
 	} else {
 		// Set before scheduling, to avoid a data race
 		conn->was_epoll_scheduled = 1;
-		return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, event);
+		return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->client.sock, e_event);
 	}
+}
+
+static int schedule_for_epoll_op(struct mg_connection *conn, uint32_t events)
+{
+    struct epoll_event e_event;
+    e_event.data.ptr = conn;
+    return schedule_event_for_epoll_op(conn, events, &e_event);
 }
 #endif
 
@@ -8958,9 +8979,8 @@ static void close_socket_gracefully(struct mg_connection *conn)
 			data->header.type = EPOLL_DATA_TYPE_CLOSE_SOCKET;
 			data->socket = socket_fd;
 			struct epoll_event event;
-			event.events = EPOLLONESHOT;
 			event.data.ptr = data;
-			if (connection_epoll_ctl(conn, &event) != -1) {
+			if (schedule_event_for_epoll_op(conn, 0, &event) != -1) {
 				conn->client.sock = INVALID_SOCKET;
 				return;
 			}
@@ -9031,18 +9051,73 @@ static void close_connection(struct mg_connection *conn)
 
 void mg_flush_response(struct mg_connection *conn)
 {
-	if (conn->client.sock != INVALID_SOCKET) {
-		if (should_keep_alive(conn)) {
-			/* Activating Nagle's algorithm implicitly flushes the send buffer */
-			if (mg_set_no_delay(&conn->client, 1) == 0) {
-				return;
-			}
-		}
-		/* And if the client connection doesn't support keep alive,
-		 * the connection must be closed to do a flush */
-		close_connection(conn);
-	}
+    if (conn->client.sock != INVALID_SOCKET) {
+        if (should_keep_alive(conn)) {
+            /* Activating Nagle's algorithm implicitly flushes the send buffer */
+            if (mg_set_no_delay(&conn->client, 1) == 0) {
+                return;
+            }
+        }
+        /* And if the client connection doesn't support keep alive,
+         * the connection must be closed to do a flush */
+        close_connection(conn);
+    }
 }
+
+#if !defined(CIVET_NO_EPOLL)
+void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t size, void (*callback)(void *, char), void *callback_context)
+{
+    if (conn != NULL) {
+        int epoll_fd = conn->ctx->epoll_fd;
+        if (epoll_fd != -1) {
+            if (conn->client.sock != INVALID_SOCKET && size > 0) { //.................. Make sure we are actually provided with some data
+                mg_set_non_blocking(&conn->client, 1);
+                // First try to send the the data w/o scheduling a epoll event. If the data are short enough, it will be
+                // more efficient.
+                ssize_t sent_count = send(conn->client.sock, buf, size, MSG_NOSIGNAL);
+                if ((size_t)sent_count == size) { // We are lucky, we managed to send everything at once w/o epoll.
+                    (*callback)(callback_context, 1);
+                    return;
+                }
+                if (sent_count != -1) {
+                    // Data were only partially sent, so we have no choice, but schedule a epoll event to send remaining data
+                    conn->response.buf = buf;
+                    conn->response.size = size;
+                    conn->response.sent_count = sent_count;
+                    conn->response.callback = callback;
+                    conn->response.callback_context = callback_context;
+                    conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
+                    if (schedule_for_epoll_op(conn, EPOLLOUT) != -1) {
+                        (*callback)(callback_context, 1);
+                        return;
+                    }
+                }
+                conn->client.sock = INVALID_SOCKET;
+                (*callback)(callback_context, 0);
+            }
+        }
+    }
+}
+
+void mg_flush_response_non_blocking(struct mg_connection *conn)
+{
+    if (conn != NULL) {
+        int epoll_fd = conn->ctx->epoll_fd;
+        if (epoll_fd != -1) {
+            if (conn->client.sock != INVALID_SOCKET && should_keep_alive(conn)) { //................................
+                reset_per_request_attributes(conn);
+                conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
+                if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
+                    return;
+                }
+                conn->client.sock = INVALID_SOCKET;
+            }
+            close_connection(conn);
+            mg_free(conn);
+        }
+    }
+}
+#endif
 
 void mg_finish(struct mg_connection *conn)
 {
@@ -9530,10 +9605,7 @@ static void process_connection(struct mg_connection *conn)
 						conn->data_len = data_len;
 					}
 					if (get_request_len(conn->buf, data_len) == 0) {
-						struct epoll_event event;
-						event.events = EPOLLONESHOT | EPOLLIN;
-						event.data.ptr = conn;
-						if (connection_epoll_ctl(conn, &event) != -1) {
+						if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
 							return;
 						}
 					}
@@ -9775,10 +9847,7 @@ static void accept_new_connection(const struct socket *listener,
 				mg_atomic_inc(&ctx->live_sockets);
 #if !defined(CIVET_NO_EPOLL)
 				conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
-				struct epoll_event event;
-				event.events = EPOLLONESHOT | EPOLLIN;
-				event.data.ptr = conn;
-				if (connection_epoll_ctl(conn, &event) != -1) {
+				if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
 					return;
 				}
 #endif
@@ -9790,6 +9859,7 @@ static void accept_new_connection(const struct socket *listener,
 		}
 	}
 }
+
 #if !defined(CIVET_NO_EPOLL)
 static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event)
 {
@@ -9831,8 +9901,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 						produce_socket(ctx, conn);
 					} else {
 						// Ask for more data as it comes in
-						event->events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
-						if (connection_epoll_ctl(conn, event) == -1) {
+						if (schedule_event_for_epoll_op(conn, EPOLLIN, event) == -1) {
 							// Failed to schedule, just let a worker handle it
 							produce_socket(ctx, conn);
 						}
@@ -9842,7 +9911,28 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 				close_connection(conn);
 				mg_free(conn);
 			}
+			break;
 		}
+        case EPOLL_DATA_TYPE_WRITE_RESPONSE: {
+            struct mg_connection *conn = event->data.ptr;
+            if (event->events & EPOLLOUT) { // Note that if it's not EPOLLOUT, then it's EPOLLERR | EPOLLHUP
+                size_t size = conn->response.size - conn->response.sent_count;
+                const void *buf = (char *)conn->response.buf + conn->response.sent_count;
+                ssize_t sent_count = send(conn->client.sock, buf, size, MSG_NOSIGNAL);
+                if ((size_t)sent_count == size) { // We are lucky, all the data were sent at once w/o further epoll
+                    (*conn->response.callback)(conn->response.callback_context, 1);
+                    break;
+                }
+                if (sent_count != -1) { // The data were sent successfully but partially, so send the rest with epoll
+                    if (schedule_event_for_epoll_op(conn, EPOLLOUT, event) != -1) {
+                        (*conn->response.callback)(conn->response.callback_context, 1);
+                        break;
+                    }
+                }
+            }
+            conn->client.sock = INVALID_SOCKET;
+            (*conn->response.callback)(conn->response.callback_context, 0);
+        }
 	}
 }
 #endif

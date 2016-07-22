@@ -406,9 +406,16 @@ CIVETWEB_API int mg_write(struct mg_connection *, const void *buf, size_t len);
 /* Flush data to the client, potentially closes the connection if keep alive isn't supported */
 CIVETWEB_API void mg_flush_response(struct mg_connection *);
 
+/* Send data to the client asynchronously. */
+CIVETWEB_API void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t size,
+										void (*callback)(void *, char), void *callback_context);
+
+/* Flush data provided by the mg_write_non_blocking call(s) to the client, potentially closes the connection if keep
+   alive isn't supported */
+CIVETWEB_API void mg_flush_response_non_blocking(struct mg_connection *);
+
 /* Close the connection early */
 CIVETWEB_API void mg_finish(struct mg_connection *);
-
 
 /* Send data to a websocket client wrapped in a websocket frame.  Uses
    mg_lock_connection to ensure that the transmission is not interrupted,
