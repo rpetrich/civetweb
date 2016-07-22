@@ -8958,28 +8958,29 @@ static int set_sock_timeout(SOCKET sock, int milliseconds)
 }
 
 #if !defined(CIVET_NO_EPOLL)
-static int connection_epoll_ctl(struct mg_connection *conn, struct epoll_event *event)
+static int schedule_event_for_epoll_op(struct mg_connection *conn, uint32_t events, struct epoll_event *e_event)
 {
 	int epoll_fd = conn->ctx->epoll_fd;
 	if (epoll_fd == -1) {
 		return -1;
 	}
-	int socket_fd = conn->client.sock;
+	// EPOLLERR is always reported, so we don't need to specify it here, but, because of a bug in some old Linux versions
+	// it wasn't the case, let's do it anyway, just in case.
+    e_event->events = events | EPOLLONESHOT | EPOLLERR;
 	if (conn->was_epoll_scheduled) {
-		return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, socket_fd, event);
+		return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->client.sock, e_event);
 	} else {
 		// Set before scheduling, to avoid a data race
 		conn->was_epoll_scheduled = 1;
-		return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, event);
+		return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->client.sock, e_event);
 	}
 }
 
-static int schedule_epoll_event_for_connection(struct mg_connection *conn, uint32_t events)
+static int schedule_for_epoll_op(struct mg_connection *conn, uint32_t events)
 {
-    struct epoll_event event;
-    event.events = events | EPOLLONESHOT | EPOLLERR;
-    event.data.ptr = conn;
-    return connection_epoll_ctl(conn, &event);
+    struct epoll_event e_event;
+    e_event.data.ptr = conn;
+    return schedule_event_for_epoll_op(conn, events, &e_event);
 }
 #endif
 
@@ -9021,9 +9022,8 @@ static void close_socket_gracefully(struct mg_connection *conn)
 			data->header.type = EPOLL_DATA_TYPE_CLOSE_SOCKET;
 			data->socket = socket_fd;
 			struct epoll_event event;
-			event.events = EPOLLONESHOT;
 			event.data.ptr = data;
-			if (connection_epoll_ctl(conn, &event) != -1) {
+			if (schedule_event_for_epoll_op(conn, 0, &event) != -1) {
 				conn->client.sock = INVALID_SOCKET;
 				return;
 			}
@@ -9129,7 +9129,7 @@ void mg_write_non_blocking(struct mg_connection *conn, void *buf)
                     if (!atomic_flag_test_and_set(&conn->response_chunk_tail_node->is_end_detected)) {
                         return;
                     }
-                    if (schedule_epoll_event_for_connection(conn, EPOLLOUT) != -1) {
+                    if (schedule_for_epoll_op(conn, EPOLLOUT) != -1) {
                         return;
                     }
                     conn->client.sock = INVALID_SOCKET;
@@ -9152,7 +9152,7 @@ void mg_flush_response_non_blocking(struct mg_connection *conn)
             if (!atomic_flag_test_and_set(&conn->response_chunk_tail_node->is_end_detected)) {
                 return;
             }
-            if (schedule_epoll_event_for_connection(conn, EPOLLOUT) != -1) {
+            if (schedule_for_epoll_op(conn, EPOLLOUT) != -1) {
                 return;
             }
             close_connection(conn);
@@ -9183,7 +9183,7 @@ void mg_write_and_flush_response_non_blocking(struct mg_connection *conn, void *
                     (*conn->free_response_chunk)(buf);
                     if (should_keep_alive(conn)) {
                         reset_per_request_attributes(conn);
-                        if (schedule_epoll_event_for_connection(conn, EPOLLIN) != -1) {
+                        if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
                             return;
                         }
                     }
@@ -9196,7 +9196,7 @@ void mg_write_and_flush_response_non_blocking(struct mg_connection *conn, void *
                 conn->response_chunk_head_node = new_node;
                 conn->currently_sent_response_chunk_node = new_node;
                 conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
-                if (schedule_epoll_event_for_connection(conn, EPOLLOUT) != -1) {
+                if (schedule_for_epoll_op(conn, EPOLLOUT) != -1) {
                     return;
                 }
                 (*conn->free_response_chunk)(buf);
@@ -9708,7 +9708,7 @@ static void process_connection(struct mg_connection *conn)
 						conn->data_len = data_len;
 					}
 					if (get_request_len(conn->buf, data_len) == 0) {
-						if (schedule_epoll_event_for_connection(conn, EPOLLIN) != -1) {
+						if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
 							return;
 						}
 					}
@@ -9953,7 +9953,7 @@ static void accept_new_connection(const struct socket *listener,
 			    conn->response_chunk_tail_node = NULL;
 			    conn->currently_sent_response_chunk_node = NULL;
 				conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
-				if (schedule_epoll_event_for_connection(conn, EPOLLIN) != -1) {
+				if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
 					return;
 				}
 #endif
@@ -10007,8 +10007,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 						produce_socket(ctx, conn);
 					} else {
 						// Ask for more data as it comes in
-						event->events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
-						if (connection_epoll_ctl(conn, event) == -1) {
+						if (schedule_event_for_epoll_op(conn, EPOLLIN, event) == -1) {
 							// Failed to schedule, just let a worker handle it
 							produce_socket(ctx, conn);
 						}
@@ -10035,8 +10034,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
                             if (should_keep_alive(conn)) {
                                 reset_per_request_attributes(conn);
                                 conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
-                                event->events = EPOLLONESHOT | EPOLLIN | EPOLLERR;
-                                if (connection_epoll_ctl(conn, event) != -1) {
+                                if (schedule_event_for_epoll_op(conn, EPOLLIN, event) != -1) {
                                     break;
                                 }
                             }
@@ -10055,8 +10053,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
                     } else {
                         node->num_response_chunk_bytes_sent += sent_count;
                     }
-                    event->events = EPOLLONESHOT | EPOLLOUT | EPOLLERR;
-                    if (connection_epoll_ctl(conn, event) != -1) {
+                    if (schedule_event_for_epoll_op(conn, EPOLLOUT, event) != -1) {
                         break;
                     }
                 }
