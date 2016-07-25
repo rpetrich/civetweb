@@ -9091,7 +9091,8 @@ static void write_non_blocking(struct mg_connection *conn)
     mg_free(conn);
 }
 
-void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t size, void (*callback)(void *, char), void *callback_context)
+void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t size,
+                           void *callback_context, void (*callback)(void *, char))
 {
     if (conn != NULL) {
         int epoll_fd = conn->ctx->epoll_fd;
