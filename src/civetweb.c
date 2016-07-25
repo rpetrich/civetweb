@@ -9065,35 +9065,46 @@ void mg_flush_response(struct mg_connection *conn)
 }
 
 #if !defined(CIVET_NO_EPOLL)
+static void write_non_blocking(struct mg_connection *conn)
+{
+    if (conn->client.sock != INVALID_SOCKET) {
+        size_t size = conn->response.size - conn->response.sent_count;
+        const void *buf = (char *)conn->response.buf + conn->response.sent_count;
+        // First try to send the the data w/o using epoll. If the data are short, it will be most efficient way.
+        ssize_t sent_count = send(conn->client.sock, buf, size, MSG_NOSIGNAL);
+        if ((size_t)sent_count == size) { // We are lucky, we managed to send everything at once w/o further epoll.
+            // The caller must call either non-blocking flush or, if there is more data, non-blocking write.
+            (*conn->response.callback)(conn->response.callback_context, 1);
+            return; // Success. Everything is done
+        }
+        if (sent_count != -1) { // Some data have been sent successfully, but not all, so send the rest with epoll
+            conn->response.sent_count += sent_count;
+            if (schedule_for_epoll_op(conn, EPOLLOUT) != -1) {
+                return; // Success. The data sending is underway using epoll
+            }
+        }
+        conn->client.sock = INVALID_SOCKET; // Prevent further non-blocking calls and ensure proper socket closing
+    }
+    // One way or another the sending has failed
+    (*conn->response.callback)(conn->response.callback_context, 0); // Should do a cleanup and must call no non-blocking functions.
+    close_connection(conn);
+    mg_free(conn);
+}
+
 void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t size, void (*callback)(void *, char), void *callback_context)
 {
     if (conn != NULL) {
         int epoll_fd = conn->ctx->epoll_fd;
         if (epoll_fd != -1) {
-            if (conn->client.sock != INVALID_SOCKET && size > 0) { //.................. Make sure we are actually provided with some data
+            if (conn->client.sock != INVALID_SOCKET) { // Proceed only if no connection failures have been detected yet
                 mg_set_non_blocking(&conn->client, 1);
-                // First try to send the the data w/o scheduling a epoll event. If the data are short enough, it will be
-                // more efficient.
-                ssize_t sent_count = send(conn->client.sock, buf, size, MSG_NOSIGNAL);
-                if ((size_t)sent_count == size) { // We are lucky, we managed to send everything at once w/o epoll.
-                    (*callback)(callback_context, 1);
-                    return;
-                }
-                if (sent_count != -1) {
-                    // Data were only partially sent, so we have no choice, but schedule a epoll event to send remaining data
-                    conn->response.buf = buf;
-                    conn->response.size = size;
-                    conn->response.sent_count = sent_count;
-                    conn->response.callback = callback;
-                    conn->response.callback_context = callback_context;
-                    conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
-                    if (schedule_for_epoll_op(conn, EPOLLOUT) != -1) {
-                        (*callback)(callback_context, 1);
-                        return;
-                    }
-                }
-                conn->client.sock = INVALID_SOCKET;
-                (*callback)(callback_context, 0);
+                conn->response.buf = buf;
+                conn->response.size = size;
+                conn->response.sent_count = 0;
+                conn->response.callback = callback;
+                conn->response.callback_context = callback_context;
+                conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
+                write_non_blocking(conn);
             }
         }
     }
@@ -9104,16 +9115,19 @@ void mg_flush_response_non_blocking(struct mg_connection *conn)
     if (conn != NULL) {
         int epoll_fd = conn->ctx->epoll_fd;
         if (epoll_fd != -1) {
-            if (conn->client.sock != INVALID_SOCKET && should_keep_alive(conn)) { //................................
-                reset_per_request_attributes(conn);
-                conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
-                if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
-                    return;
+            if (conn->client.sock != INVALID_SOCKET) { // Proceed only if no connection failures have been detected yet
+                if (should_keep_alive(conn)) {
+                    // Re-use the connection. Start it by preparing it to receive a new request.
+                    reset_per_request_attributes(conn);
+                    conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
+                    if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
+                        return;
+                    }
                 }
-                conn->client.sock = INVALID_SOCKET;
+                conn->client.sock = INVALID_SOCKET; // Ensure proper socket closing
+                close_connection(conn);
+                mg_free(conn);
             }
-            close_connection(conn);
-            mg_free(conn);
         }
     }
 }
@@ -9915,23 +9929,10 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 		}
         case EPOLL_DATA_TYPE_WRITE_RESPONSE: {
             struct mg_connection *conn = event->data.ptr;
-            if (event->events & EPOLLOUT) { // Note that if it's not EPOLLOUT, then it's EPOLLERR | EPOLLHUP
-                size_t size = conn->response.size - conn->response.sent_count;
-                const void *buf = (char *)conn->response.buf + conn->response.sent_count;
-                ssize_t sent_count = send(conn->client.sock, buf, size, MSG_NOSIGNAL);
-                if ((size_t)sent_count == size) { // We are lucky, all the data were sent at once w/o further epoll
-                    (*conn->response.callback)(conn->response.callback_context, 1);
-                    break;
-                }
-                if (sent_count != -1) { // The data were sent successfully but partially, so send the rest with epoll
-                    if (schedule_event_for_epoll_op(conn, EPOLLOUT, event) != -1) {
-                        (*conn->response.callback)(conn->response.callback_context, 1);
-                        break;
-                    }
-                }
+            if (!(event->events & EPOLLOUT)) { // Note that if it's not EPOLLOUT, then it's EPOLLERR | EPOLLHUP
+                conn->client.sock = INVALID_SOCKET; // Prevent further non-blocking calls and ensure proper socket closing
             }
-            conn->client.sock = INVALID_SOCKET;
-            (*conn->response.callback)(conn->response.callback_context, 0);
+            write_non_blocking(conn);
         }
 	}
 }

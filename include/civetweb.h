@@ -406,12 +406,13 @@ CIVETWEB_API int mg_write(struct mg_connection *, const void *buf, size_t len);
 /* Flush data to the client, potentially closes the connection if keep alive isn't supported */
 CIVETWEB_API void mg_flush_response(struct mg_connection *);
 
-/* Send data to the client asynchronously. */
+/* Send data to the client asynchronously. This function can be called directly on;y once per response. All additional
+   calls, if necessary, must be done from the callback. */
 CIVETWEB_API void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t size,
 										void (*callback)(void *, char), void *callback_context);
 
 /* Flush data provided by the mg_write_non_blocking call(s) to the client, potentially closes the connection if keep
-   alive isn't supported */
+   alive isn't supported. This function must be called from a mg_write_non_blocking callback. */
 CIVETWEB_API void mg_flush_response_non_blocking(struct mg_connection *);
 
 /* Close the connection early */
