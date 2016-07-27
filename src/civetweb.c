@@ -7841,8 +7841,15 @@ static int deprecated_websocket_data_wrapper(
  * This function is called when the request is read, parsed and validated,
  * and Civetweb must decide what action to take: serve a file, or
  * a directory, or call embedded function, etcetera. */
+#if !defined(CIVET_NO_EPOLL)
+// The non_blocking_response argument informs the caller whether the response was sent in a non-blocking manner.
+static void handle_request(struct mg_connection *conn, _Bool *non_blocking_response)
+{
+    *non_blocking_response = 0;
+#else
 static void handle_request(struct mg_connection *conn)
 {
+#endif
 	if (conn) {
 		struct mg_request_info *ri = &conn->request_info;
 		char path[PATH_MAX];
@@ -7911,12 +7918,18 @@ static void handle_request(struct mg_connection *conn)
 
 		/* 4. call a "handle everything" callback, if registered */
 		if (conn->ctx->callbacks.begin_request != NULL) {
+#if !defined(CIVET_NO_EPOLL)
+            _Bool epoll_available = (conn->ctx->epoll_fd != -1);
+#endif
 			/* Note that since V1.7 the "begin_request" function is called
 			 * before an authorization check. If an authorization check is
 			 * required, use a request_handler instead. */
 			i = conn->ctx->callbacks.begin_request(conn);
 			switch (i) {
 			case 1:
+#if !defined(CIVET_NO_EPOLL)
+                *non_blocking_response = epoll_available;
+#endif
 				/* callback already processed the request */
 				return;
 			case 0:
@@ -9067,7 +9080,79 @@ void mg_flush_response(struct mg_connection *conn)
     }
 }
 
+static void free_remote_user(struct mg_connection *conn)
+{
+    struct mg_request_info *ri = &conn->request_info;
+    if (ri->remote_user != NULL) {
+        mg_free((void *)ri->remote_user);
+        /* Important! When having connections with and without auth
+         * would cause double free and then crash */
+        ri->remote_user = NULL;
+    }
+}
+
+static void complete_handling_request(struct mg_connection *conn)
+{
+    if (conn->ctx->callbacks.end_request != NULL) {
+        conn->ctx->callbacks.end_request(conn, conn->status_code);
+    }
+    log_access(conn);
+}
+
+// If keep-alive is required, returns 1, otherwise returns 0.
+static int check_keep_alive_while_discard_buffered_data(struct mg_connection *conn)
+{
+    /* NOTE(lsm): order is important here. should_keep_alive() call is
+     * using parsed request, which will be invalid after memmove's
+     * below.
+     * Therefore, memorize should_keep_alive() result now for later use
+     * in loop exit condition. */
+    int keep_alive = conn->ctx->stop_flag == 0 && conn->content_len >= 0 && should_keep_alive(conn);
+
+    /* Discard all buffered data for this request */
+    int discard_len = conn->content_len >= 0 && conn->request_len > 0 &&
+                          conn->request_len + conn->content_len <
+                              (int64_t)conn->data_len
+                      ? (int)(conn->request_len + conn->content_len)
+                      : conn->data_len;
+    /*assert(discard_len >= 0);*/
+    if (discard_len < 0)
+        return 0;
+    conn->data_len -= discard_len;
+    if (conn->data_len > 0)
+        memmove(
+            conn->buf, conn->buf + discard_len, (size_t)conn->data_len);
+
+    /* assert(conn->data_len >= 0); */
+    /* assert(conn->data_len <= conn->buf_size); */
+
+    if ((conn->data_len < 0) || (conn->data_len > MAX_REQUEST_SIZE))
+        return 0;
+
+    return keep_alive;
+}
+
 #if !defined(CIVET_NO_EPOLL)
+static int prepare_connection_for_new_request(struct mg_connection *conn) {
+    if (conn->ctx->epoll_fd != -1) {
+        // Speculatively try to read the next request
+        mg_set_non_blocking(&conn->client, 1);
+        sched_yield();
+        int data_len = conn->data_len;
+        int n = (int)recv(conn->client.sock, conn->buf + data_len, (size_t)MAX_REQUEST_SIZE - data_len, 0);
+        if (n > 0) {
+            data_len += n;
+            conn->data_len = data_len;
+        }
+        if (get_request_len(conn->buf, data_len) == 0) {
+            if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static void write_non_blocking(struct mg_connection *conn)
 {
     if (conn->client.sock != INVALID_SOCKET) {
@@ -9090,6 +9175,7 @@ static void write_non_blocking(struct mg_connection *conn)
     }
     // One way or another the sending has failed
     (*conn->response.callback)(conn->response.callback_context, 0); // Should do a cleanup and must call no non-blocking functions.
+    free_remote_user(conn);
     close_connection(conn);
     mg_free(conn);
 }
@@ -9100,18 +9186,18 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
     if (conn == NULL) {
         return;
     }
-    int epoll_fd = conn->ctx->epoll_fd;
-    if (epoll_fd != -1) {
-        if (conn->client.sock != INVALID_SOCKET) { // Proceed only if no connection failures have been detected yet
-            mg_set_non_blocking(&conn->client, 1);
-            conn->response.buf = buf;
-            conn->response.size = size;
-            conn->response.sent_count = 0;
-            conn->response.callback = callback;
-            conn->response.callback_context = callback_context;
-            conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
-            write_non_blocking(conn);
+    if (conn->ctx->epoll_fd != -1) {
+        if (conn->client.sock == INVALID_SOCKET) {
+            return; // It's a mistake to call this function after the socket has failed, so do nothing.
         }
+        mg_set_non_blocking(&conn->client, 1);
+        conn->response.buf = buf;
+        conn->response.size = size;
+        conn->response.sent_count = 0;
+        conn->response.callback = callback;
+        conn->response.callback_context = callback_context;
+        conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
+        write_non_blocking(conn);
     }
 }
 
@@ -9120,21 +9206,22 @@ void mg_flush_response_non_blocking(struct mg_connection *conn)
     if (conn == NULL) {
         return;
     }
-    int epoll_fd = conn->ctx->epoll_fd;
-    if (epoll_fd != -1) {
-        if (conn->client.sock != INVALID_SOCKET) { // Proceed only if no connection failures have been detected yet
-            if (should_keep_alive(conn)) {
-                // Re-use the connection. Start it by preparing it to receive a new request.
-                reset_per_request_attributes(conn);
-                conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
-                if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
-                    return;
-                }
-            }
-            conn->client.sock = INVALID_SOCKET; // Ensure proper socket closing
-            close_connection(conn);
-            mg_free(conn);
+    if (conn->ctx->epoll_fd != -1) {
+        if (conn->client.sock == INVALID_SOCKET) {
+            return; // It's a mistake to call this function after the socket has failed, so do nothing.
         }
+        complete_handling_request(conn);
+        free_remote_user(conn);
+        if (check_keep_alive_while_discard_buffered_data(conn)) {
+            // Return the worker thread to the pool and have the main thread resume processing the keep alive
+            reset_per_request_attributes(conn);
+            conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
+            if (prepare_connection_for_new_request(conn)) {
+                return;
+            }
+        }
+        close_connection(conn);
+        mg_free(conn);
     }
 }
 #endif
@@ -9540,11 +9627,10 @@ static void process_connection(struct mg_connection *conn)
 {
 	if (conn && conn->ctx) {
 		struct mg_request_info *ri = &conn->request_info;
-		int keep_alive, discard_len;
 		char ebuf[100];
 		int reqerr;
 
-		do {
+		for (;;) {
 			if (!getreq(conn, ebuf, sizeof(ebuf), &reqerr)) {
 				/* The request sent by the client could not be understood by
 				 * the server, or it was incomplete or a timeout. Send an
@@ -9566,73 +9652,32 @@ static void process_connection(struct mg_connection *conn)
 			}
 
 			if (ebuf[0] == '\0') {
-				handle_request(conn);
-				if (conn->ctx->callbacks.end_request != NULL) {
-					conn->ctx->callbacks.end_request(conn, conn->status_code);
-				}
-				log_access(conn);
+#if !defined(CIVET_NO_EPOLL)
+				_Bool non_blocking_response;
+			    handle_request(conn, &non_blocking_response);
+			    if (non_blocking_response) {
+			        return;
+			    }
+#else
+                handle_request(conn);
+#endif
+	            complete_handling_request(conn);
 			} else {
 				conn->must_close = 1;
 			}
 
-			if (ri->remote_user != NULL) {
-				mg_free((void *)ri->remote_user);
-				/* Important! When having connections with and without auth
-				 * would cause double free and then crash */
-				ri->remote_user = NULL;
-			}
-
-			/* NOTE(lsm): order is important here. should_keep_alive() call is
-			 * using parsed request, which will be invalid after memmove's
-			 * below.
-			 * Therefore, memorize should_keep_alive() result now for later use
-			 * in loop exit condition. */
-			keep_alive = conn->ctx->stop_flag == 0 &&
-			             conn->content_len >= 0 && should_keep_alive(conn);
-
-			/* Discard all buffered data for this request */
-			discard_len = conn->content_len >= 0 && conn->request_len > 0 &&
-			                      conn->request_len + conn->content_len <
-			                          (int64_t)conn->data_len
-			                  ? (int)(conn->request_len + conn->content_len)
-			                  : conn->data_len;
-			/*assert(discard_len >= 0);*/
-			if (discard_len < 0)
+		    free_remote_user(conn);
+		    if (!check_keep_alive_while_discard_buffered_data(conn)) {
 				break;
-			conn->data_len -= discard_len;
-			if (conn->data_len > 0)
-				memmove(
-				    conn->buf, conn->buf + discard_len, (size_t)conn->data_len);
-
-			/* assert(conn->data_len >= 0); */
-			/* assert(conn->data_len <= conn->buf_size); */
-
-			if ((conn->data_len < 0) || (conn->data_len > MAX_REQUEST_SIZE))
-				break;
-
+		    }
 			// Return the worker thread to the pool and have the main thread resume processing the keep alive
-			if (keep_alive) {
-				reset_per_request_attributes(conn);
+		    reset_per_request_attributes(conn);
 #if !defined(CIVET_NO_EPOLL)
-				if (conn->ctx->epoll_fd != -1) {
-					// Speculatively try to read the next request
-					mg_set_non_blocking(&conn->client, 1);
-					sched_yield();
-					int data_len = conn->data_len;
-					int n = (int)recv(conn->client.sock, conn->buf + data_len, (size_t)MAX_REQUEST_SIZE - data_len, 0);
-					if (n > 0) {
-						data_len += n;
-						conn->data_len = data_len;
-					}
-					if (get_request_len(conn->buf, data_len) == 0) {
-						if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
-							return;
-						}
-					}
-				}
+            if (prepare_connection_for_new_request(conn)) {
+                return;
+            }
 #endif
-			}
-		} while (keep_alive);
+		} // for
 	}
 	close_connection(conn);
 	mg_free(conn);
