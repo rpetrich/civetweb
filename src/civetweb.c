@@ -7850,360 +7850,357 @@ static void handle_request(struct mg_connection *conn, _Bool *non_blocking_respo
 static void handle_request(struct mg_connection *conn)
 {
 #endif
-	if (conn) {
-		struct mg_request_info *ri = &conn->request_info;
-		char path[PATH_MAX];
-		int uri_len, ssl_index, is_script_resource, is_websocket_request,
-		    is_put_or_delete_request, is_callback_resource;
-		int i;
-		struct file file = STRUCT_FILE_INITIALIZER;
+    struct mg_request_info *ri = &conn->request_info;
+    char path[PATH_MAX];
+    int uri_len, ssl_index, is_script_resource, is_websocket_request,
+        is_put_or_delete_request, is_callback_resource;
+    int i;
+    struct file file = STRUCT_FILE_INITIALIZER;
 #if !defined(NO_FILES)
-		time_t curtime;
+    time_t curtime;
 #endif
-		mg_request_handler callback_handler = NULL;
+    mg_request_handler callback_handler = NULL;
 #if defined(USE_WEBSOCKET)
-		mg_websocket_connect_handler ws_connect_handler = NULL;
-		mg_websocket_ready_handler ws_ready_handler = NULL;
-		mg_websocket_data_handler ws_data_handler = NULL;
-		mg_websocket_close_handler ws_close_handler = NULL;
+    mg_websocket_connect_handler ws_connect_handler = NULL;
+    mg_websocket_ready_handler ws_ready_handler = NULL;
+    mg_websocket_data_handler ws_data_handler = NULL;
+    mg_websocket_close_handler ws_close_handler = NULL;
 #endif
-		void *callback_data = NULL;
+    void *callback_data = NULL;
 #if !defined(NO_FILES)
-		char date[64];
+    char date[64];
 #endif
 
-		path[0] = 0;
+    path[0] = 0;
 
-		if (!ri)
-			return;
-		/* 1. get the request url */
-		/* 1.1. split into url and query string */
-		if ((conn->request_info.query_string = strchr(ri->uri, '?')) != NULL) {
-			*((char *)conn->request_info.query_string++) = '\0';
-		}
-		uri_len = (int)strlen(ri->uri);
+    if (!ri)
+        return;
+    /* 1. get the request url */
+    /* 1.1. split into url and query string */
+    if ((conn->request_info.query_string = strchr(ri->uri, '?')) != NULL) {
+        *((char *)conn->request_info.query_string++) = '\0';
+    }
+    uri_len = (int)strlen(ri->uri);
 
-		/* 1.2. decode url (if config says so) */
-		if (should_decode_url(conn)) {
-			mg_url_decode(ri->uri, uri_len, (char *)ri->uri, uri_len + 1, 0);
-		}
+    /* 1.2. decode url (if config says so) */
+    if (should_decode_url(conn)) {
+        mg_url_decode(ri->uri, uri_len, (char *)ri->uri, uri_len + 1, 0);
+    }
 
-		/* 1.3. clean URIs, so a path like allowed_dir/../forbidden_file is not
-		 * possible */
-		remove_double_dots_and_double_slashes((char *)ri->uri);
+    /* 1.3. clean URIs, so a path like allowed_dir/../forbidden_file is not
+     * possible */
+    remove_double_dots_and_double_slashes((char *)ri->uri);
 
-		/* step 1. completed, the url is known now */
-		DEBUG_TRACE("URL: %s", ri->uri);
+    /* step 1. completed, the url is known now */
+    DEBUG_TRACE("URL: %s", ri->uri);
 
-		/* 2. do a https redirect, if required */
-		if (!conn->client.is_ssl && conn->client.ssl_redir) {
-			ssl_index = get_first_ssl_listener_index(conn->ctx);
-			if (ssl_index >= 0) {
-				redirect_to_https_port(conn, ssl_index);
-			} else {
-				/* A http to https forward port has been specified,
-				 * but no https port to forward to. */
-				send_http_error(conn,
-				                503,
-				                "%s",
-				                "Error: SSL forward not configured properly");
-				mg_cry(conn, "Can not redirect to SSL, no SSL port available");
-			}
-			return;
-		}
+    /* 2. do a https redirect, if required */
+    if (!conn->client.is_ssl && conn->client.ssl_redir) {
+        ssl_index = get_first_ssl_listener_index(conn->ctx);
+        if (ssl_index >= 0) {
+            redirect_to_https_port(conn, ssl_index);
+        } else {
+            /* A http to https forward port has been specified,
+             * but no https port to forward to. */
+            send_http_error(conn,
+                            503,
+                            "%s",
+                            "Error: SSL forward not configured properly");
+            mg_cry(conn, "Can not redirect to SSL, no SSL port available");
+        }
+        return;
+    }
 
-		/* 3. if this ip has limited speed, set it for this connection */
-		conn->throttle = set_throttle(
-		    conn->ctx->config[THROTTLE], get_remote_ip(conn), ri->uri);
+    /* 3. if this ip has limited speed, set it for this connection */
+    conn->throttle = set_throttle(
+        conn->ctx->config[THROTTLE], get_remote_ip(conn), ri->uri);
 
-		/* 4. call a "handle everything" callback, if registered */
-		if (conn->ctx->callbacks.begin_request != NULL) {
+    /* 4. call a "handle everything" callback, if registered */
+    if (conn->ctx->callbacks.begin_request != NULL) {
 #if !defined(CIVET_NO_EPOLL)
-            _Bool epoll_available = (conn->ctx->epoll_fd != -1);
+        _Bool epoll_available = (conn->ctx->epoll_fd != -1);
 #endif
-			/* Note that since V1.7 the "begin_request" function is called
-			 * before an authorization check. If an authorization check is
-			 * required, use a request_handler instead. */
-			i = conn->ctx->callbacks.begin_request(conn);
-			switch (i) {
-			case 1:
+        /* Note that since V1.7 the "begin_request" function is called
+         * before an authorization check. If an authorization check is
+         * required, use a request_handler instead. */
+        i = conn->ctx->callbacks.begin_request(conn);
+        switch (i) {
+        case 1:
 #if !defined(CIVET_NO_EPOLL)
-                *non_blocking_response = epoll_available;
+            *non_blocking_response = epoll_available;
 #endif
-				/* callback already processed the request */
-				return;
-			case 0:
-				/* civetweb should process the request */
-				break;
-			default:
-				/* unspecified - may change with the next version */
-				return;
-			}
-		}
+            /* callback already processed the request */
+            return;
+        case 0:
+            /* civetweb should process the request */
+            break;
+        default:
+            /* unspecified - may change with the next version */
+            return;
+        }
+    }
 
-		/* request not yet handled by a handler or redirect, so the request
-		 * is processed here */
+    /* request not yet handled by a handler or redirect, so the request
+     * is processed here */
 
-		/* 5. interpret the url to find out how the request must be handled */
-		/* 5.1. first test, if the request targets the regular http(s)://
-		 * protocol namespace or the websocket ws(s):// protocol namespace. */
+    /* 5. interpret the url to find out how the request must be handled */
+    /* 5.1. first test, if the request targets the regular http(s)://
+     * protocol namespace or the websocket ws(s):// protocol namespace. */
 #if defined(USE_WEBSOCKET)
-		is_websocket_request = is_websocket_protocol(conn);
+    is_websocket_request = is_websocket_protocol(conn);
 #else
-		is_websocket_request = 0;
+    is_websocket_request = 0;
 #endif
 
-		/* 5.2. check if the request will be handled by a callback */
-		if (get_request_handler(conn,
-		                        is_websocket_request,
-		                        &callback_handler,
+    /* 5.2. check if the request will be handled by a callback */
+    if (get_request_handler(conn,
+                            is_websocket_request,
+                            &callback_handler,
 #if defined(USE_WEBSOCKET)
-		                        &ws_connect_handler,
-		                        &ws_ready_handler,
-		                        &ws_data_handler,
-		                        &ws_close_handler,
+                            &ws_connect_handler,
+                            &ws_ready_handler,
+                            &ws_data_handler,
+                            &ws_close_handler,
 #endif
-		                        &callback_data)) {
-			/* 5.2.1. A callback will handle this request. All requests handled
-			 * by a callback have to be considered as requests to a script
-			 * resource. */
-			is_callback_resource = 1;
-			is_script_resource = 1;
-			is_put_or_delete_request = is_put_or_delete_method(conn);
-		} else {
-		no_callback_resource:
-			/* 5.2.2. No callback is responsible for this request. The URI
-			 * addresses a file based resource (static content or Lua/cgi
-			 * scripts in the file system). */
-			is_callback_resource = 0;
-			interpret_uri(conn,
-			              path,
-			              sizeof(path),
-			              &file,
-			              &is_script_resource,
-			              &is_websocket_request,
-			              &is_put_or_delete_request);
-		}
+                            &callback_data)) {
+        /* 5.2.1. A callback will handle this request. All requests handled
+         * by a callback have to be considered as requests to a script
+         * resource. */
+        is_callback_resource = 1;
+        is_script_resource = 1;
+        is_put_or_delete_request = is_put_or_delete_method(conn);
+    } else {
+    no_callback_resource:
+        /* 5.2.2. No callback is responsible for this request. The URI
+         * addresses a file based resource (static content or Lua/cgi
+         * scripts in the file system). */
+        is_callback_resource = 0;
+        interpret_uri(conn,
+                      path,
+                      sizeof(path),
+                      &file,
+                      &is_script_resource,
+                      &is_websocket_request,
+                      &is_put_or_delete_request);
+    }
 
-		/* 6. authorization check */
-		if (is_put_or_delete_request && !is_script_resource &&
-		    !is_callback_resource) {
+    /* 6. authorization check */
+    if (is_put_or_delete_request && !is_script_resource &&
+        !is_callback_resource) {
 /* 6.1. this request is a PUT/DELETE to a real file */
 /* 6.1.1. thus, the server must have real files */
 #if defined(NO_FILES)
-			if (1) {
+        if (1) {
 #else
-			if (conn->ctx->config[DOCUMENT_ROOT] == NULL) {
+        if (conn->ctx->config[DOCUMENT_ROOT] == NULL) {
 #endif
-				/* This server does not have any real files, thus the
-				 * PUT/DELETE methods are not valid. */
-				send_http_error(conn,
-				                405,
-				                "%s method not allowed",
-				                conn->request_info.request_method);
-				return;
-			}
+            /* This server does not have any real files, thus the
+             * PUT/DELETE methods are not valid. */
+            send_http_error(conn,
+                            405,
+                            "%s method not allowed",
+                            conn->request_info.request_method);
+            return;
+        }
 
-			/* 6.1.2. Check if put authorization for static files is available.
-			 */
-			if (!is_authorized_for_put(conn)) {
-				send_authorization_request(conn);
-				return;
-			}
+        /* 6.1.2. Check if put authorization for static files is available.
+         */
+        if (!is_authorized_for_put(conn)) {
+            send_authorization_request(conn);
+            return;
+        }
 
-		} else {
-			/* 6.2. This is either a OPTIONS, GET, HEAD or POST request,
-			 * or it is a PUT or DELETE request to a resource that does not
-			 * correspond to a file. Check authorization. */
-			if (!check_authorization(conn, path)) {
-				send_authorization_request(conn);
-				return;
-			}
-		}
+    } else {
+        /* 6.2. This is either a OPTIONS, GET, HEAD or POST request,
+         * or it is a PUT or DELETE request to a resource that does not
+         * correspond to a file. Check authorization. */
+        if (!check_authorization(conn, path)) {
+            send_authorization_request(conn);
+            return;
+        }
+    }
 
-		/* request is authorized or does not need authorization */
+    /* request is authorized or does not need authorization */
 
-		/* 7. check if there are request handlers for this uri */
-		if (is_callback_resource) {
-			if (!is_websocket_request) {
-				if (callback_handler(conn, callback_data)) {
-					/* Do nothing, callback has served the request */
-					discard_unread_request_data(conn);
-				} else {
-					/* TODO: what if the handler did NOT handle the request */
-					/* The last version did handle this as a file request, but
-					 * since a file request is not always a script resource,
-					 * the authorization check might be different */
-					interpret_uri(conn,
-					              path,
-					              sizeof(path),
-					              &file,
-					              &is_script_resource,
-					              &is_websocket_request,
-					              &is_put_or_delete_request);
-					callback_handler = NULL;
+    /* 7. check if there are request handlers for this uri */
+    if (is_callback_resource) {
+        if (!is_websocket_request) {
+            if (callback_handler(conn, callback_data)) {
+                /* Do nothing, callback has served the request */
+                discard_unread_request_data(conn);
+            } else {
+                /* TODO: what if the handler did NOT handle the request */
+                /* The last version did handle this as a file request, but
+                 * since a file request is not always a script resource,
+                 * the authorization check might be different */
+                interpret_uri(conn,
+                              path,
+                              sizeof(path),
+                              &file,
+                              &is_script_resource,
+                              &is_websocket_request,
+                              &is_put_or_delete_request);
+                callback_handler = NULL;
 
-					/* TODO: for the moment, a goto is simpler than some
-					 * curious loop. */
-					/* The situation "callback does not handle the request"
-					 * needs to be reconsidered anyway. */
-					goto no_callback_resource;
-				}
-			} else {
+                /* TODO: for the moment, a goto is simpler than some
+                 * curious loop. */
+                /* The situation "callback does not handle the request"
+                 * needs to be reconsidered anyway. */
+                goto no_callback_resource;
+            }
+        } else {
 #if defined(USE_WEBSOCKET)
-				handle_websocket_request(conn,
-				                         path,
-				                         is_callback_resource,
-				                         ws_connect_handler,
-				                         ws_ready_handler,
-				                         ws_data_handler,
-				                         ws_close_handler,
-				                         callback_data);
+            handle_websocket_request(conn,
+                                     path,
+                                     is_callback_resource,
+                                     ws_connect_handler,
+                                     ws_ready_handler,
+                                     ws_data_handler,
+                                     ws_close_handler,
+                                     callback_data);
 #endif
-			}
-			return;
-		}
+        }
+        return;
+    }
 
 /* 8. handle websocket requests */
 #if defined(USE_WEBSOCKET)
-		if (is_websocket_request) {
-			handle_websocket_request(
-			    conn,
-			    path,
-			    !is_script_resource /* could be deprecated global callback */,
-			    deprecated_websocket_connect_wrapper,
-			    deprecated_websocket_ready_wrapper,
-			    deprecated_websocket_data_wrapper,
-			    NULL,
-			    &conn->ctx->callbacks);
-			return;
-		} else
+    if (is_websocket_request) {
+        handle_websocket_request(
+            conn,
+            path,
+            !is_script_resource /* could be deprecated global callback */,
+            deprecated_websocket_connect_wrapper,
+            deprecated_websocket_ready_wrapper,
+            deprecated_websocket_data_wrapper,
+            NULL,
+            &conn->ctx->callbacks);
+        return;
+    } else
 #endif
 
 #if defined(NO_FILES)
-			/* 9a. In case the server uses only callbacks, this uri is unknown.
-			 * Then, all request handling ends here. */
-			send_http_error(conn, 404, "%s", "Not Found");
+        /* 9a. In case the server uses only callbacks, this uri is unknown.
+         * Then, all request handling ends here. */
+        send_http_error(conn, 404, "%s", "Not Found");
 
 #else
-		/* 9b. This request is either for a static file or resource handled
-		 * by a script file. Thus, a DOCUMENT_ROOT must exist. */
-		if (conn->ctx->config[DOCUMENT_ROOT] == NULL) {
-			send_http_error(conn, 404, "%s", "Not Found");
-			return;
-		}
+    /* 9b. This request is either for a static file or resource handled
+     * by a script file. Thus, a DOCUMENT_ROOT must exist. */
+    if (conn->ctx->config[DOCUMENT_ROOT] == NULL) {
+        send_http_error(conn, 404, "%s", "Not Found");
+        return;
+    }
 
-		/* 10. File is handled by a script. */
-		if (is_script_resource) {
-			handle_file_based_request(conn, path, &file);
-			return;
-		}
+    /* 10. File is handled by a script. */
+    if (is_script_resource) {
+        handle_file_based_request(conn, path, &file);
+        return;
+    }
 
-		/* 11. Handle put/delete/mkcol requests */
-		if (is_put_or_delete_request) {
-			/* 11.1. PUT method */
-			if (!strcmp(ri->request_method, "PUT")) {
-				put_file(conn, path);
-				return;
-			}
-			/* 11.2. DELETE method */
-			if (!strcmp(ri->request_method, "DELETE")) {
-				delete_file(conn, path);
-				return;
-			}
-			/* 11.3. MKCOL method */
-			if (!strcmp(ri->request_method, "MKCOL")) {
-				mkcol(conn, path);
-				return;
-			}
-			/* 11.4. should never reach this point */
-			send_http_error(conn,
-			                405,
-			                "%s method not allowed",
-			                conn->request_info.request_method);
-			return;
-		}
+    /* 11. Handle put/delete/mkcol requests */
+    if (is_put_or_delete_request) {
+        /* 11.1. PUT method */
+        if (!strcmp(ri->request_method, "PUT")) {
+            put_file(conn, path);
+            return;
+        }
+        /* 11.2. DELETE method */
+        if (!strcmp(ri->request_method, "DELETE")) {
+            delete_file(conn, path);
+            return;
+        }
+        /* 11.3. MKCOL method */
+        if (!strcmp(ri->request_method, "MKCOL")) {
+            mkcol(conn, path);
+            return;
+        }
+        /* 11.4. should never reach this point */
+        send_http_error(conn,
+                        405,
+                        "%s method not allowed",
+                        conn->request_info.request_method);
+        return;
+    }
 
-		/* 11. File does not exist, or it was configured that it should be
-		 * hidden */
-		if (((file.membuf == NULL) && (file.modification_time == (time_t)0)) ||
-		    (must_hide_file(conn, path))) {
-			send_http_error(conn, 404, "%s", "Not found");
-			return;
-		}
+    /* 11. File does not exist, or it was configured that it should be
+     * hidden */
+    if (((file.membuf == NULL) && (file.modification_time == (time_t)0)) ||
+        (must_hide_file(conn, path))) {
+        send_http_error(conn, 404, "%s", "Not found");
+        return;
+    }
 
-		/* 12. Directories uris should end with a slash */
-		if (file.is_directory && ri->uri[uri_len - 1] != '/') {
-			curtime = time(NULL);
-			gmt_time_string(date, sizeof(date), &curtime);
-			mg_printf(conn,
-			          "HTTP/1.1 301 Moved Permanently\r\n"
-			          "Location: %s/\r\n"
-			          "Date: %s\r\n"
-			          "Content-Length: 0\r\n"
-			          "Connection: %s\r\n\r\n",
-			          ri->uri,
-			          date,
-			          suggest_connection_header(conn));
-			return;
-		}
+    /* 12. Directories uris should end with a slash */
+    if (file.is_directory && ri->uri[uri_len - 1] != '/') {
+        curtime = time(NULL);
+        gmt_time_string(date, sizeof(date), &curtime);
+        mg_printf(conn,
+                  "HTTP/1.1 301 Moved Permanently\r\n"
+                  "Location: %s/\r\n"
+                  "Date: %s\r\n"
+                  "Content-Length: 0\r\n"
+                  "Connection: %s\r\n\r\n",
+                  ri->uri,
+                  date,
+                  suggest_connection_header(conn));
+        return;
+    }
 
-		/* 13. Handle other methods than GET/HEAD */
-		/* 13.1. Handle PROPFIND */
-		if (!strcmp(ri->request_method, "PROPFIND")) {
-			handle_propfind(conn, path, &file);
-			return;
-		}
-		/* 13.2. Handle OPTIONS for files */
-		if (!strcmp(ri->request_method, "OPTIONS")) {
-			/* This standard handler is only used for real files.
-			 * Scripts should support the OPTIONS method themselves, to allow a
-			 * maximum flexibility.
-			 * Lua and CGI scripts may fully support CORS this way (including
-			 * preflights). */
-			send_options(conn);
-			return;
-		}
-		/* 13.3. everything but GET and HEAD (e.g. POST) */
-		if (0 != strcmp(ri->request_method, "GET") &&
-		    0 != strcmp(ri->request_method, "HEAD")) {
-			send_http_error(conn,
-			                405,
-			                "%s method not allowed",
-			                conn->request_info.request_method);
-			return;
-		}
+    /* 13. Handle other methods than GET/HEAD */
+    /* 13.1. Handle PROPFIND */
+    if (!strcmp(ri->request_method, "PROPFIND")) {
+        handle_propfind(conn, path, &file);
+        return;
+    }
+    /* 13.2. Handle OPTIONS for files */
+    if (!strcmp(ri->request_method, "OPTIONS")) {
+        /* This standard handler is only used for real files.
+         * Scripts should support the OPTIONS method themselves, to allow a
+         * maximum flexibility.
+         * Lua and CGI scripts may fully support CORS this way (including
+         * preflights). */
+        send_options(conn);
+        return;
+    }
+    /* 13.3. everything but GET and HEAD (e.g. POST) */
+    if (0 != strcmp(ri->request_method, "GET") &&
+        0 != strcmp(ri->request_method, "HEAD")) {
+        send_http_error(conn,
+                        405,
+                        "%s method not allowed",
+                        conn->request_info.request_method);
+        return;
+    }
 
-		/* 14. directories */
-		if (file.is_directory) {
-			if (substitute_index_file(conn, path, sizeof(path), &file)) {
-				/* 14.1. use a substitute file */
-				/* TODO: substitute index may be a script resource.
-				 * define what should be possible in this case. */
-			} else {
-				/* 14.2. no substitute file */
-				if (!mg_strcasecmp(conn->ctx->config[ENABLE_DIRECTORY_LISTING],
-				                   "yes")) {
-					handle_directory_request(conn, path);
-				} else {
-					send_http_error(
-					    conn, 403, "%s", "Error: Directory listing denied");
-				}
-				return;
-			}
-		}
+    /* 14. directories */
+    if (file.is_directory) {
+        if (substitute_index_file(conn, path, sizeof(path), &file)) {
+            /* 14.1. use a substitute file */
+            /* TODO: substitute index may be a script resource.
+             * define what should be possible in this case. */
+        } else {
+            /* 14.2. no substitute file */
+            if (!mg_strcasecmp(conn->ctx->config[ENABLE_DIRECTORY_LISTING],
+                               "yes")) {
+                handle_directory_request(conn, path);
+            } else {
+                send_http_error(
+                    conn, 403, "%s", "Error: Directory listing denied");
+            }
+            return;
+        }
+    }
 
-		handle_file_based_request(conn, path, &file);
+    handle_file_based_request(conn, path, &file);
 #endif /* !defined(NO_FILES) */
 
 #if 0
-            /* Perform redirect and auth checks before calling begin_request()
-             * handler.
-             * Otherwise, begin_request() would need to perform auth checks and
-             * redirects. */
+        /* Perform redirect and auth checks before calling begin_request()
+         * handler.
+         * Otherwise, begin_request() would need to perform auth checks and
+         * redirects. */
 #endif
-	}
-	return;
 }
 
 static void handle_file_based_request(struct mg_connection *conn,
@@ -9656,7 +9653,7 @@ static void process_connection(struct mg_connection *conn)
 				_Bool non_blocking_response;
 			    handle_request(conn, &non_blocking_response);
 			    if (non_blocking_response) {
-			        return;
+			        return; // The response was sent in a non-blocking manner, so nothing is left to do here
 			    }
 #else
                 handle_request(conn);
@@ -9674,7 +9671,7 @@ static void process_connection(struct mg_connection *conn)
 		    reset_per_request_attributes(conn);
 #if !defined(CIVET_NO_EPOLL)
             if (prepare_connection_for_new_request(conn)) {
-                return;
+                return; // The non-blocking request receiving was successfully scheduled, so nothing is left to do here
             }
 #endif
 		} // for
