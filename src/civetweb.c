@@ -9051,6 +9051,9 @@ static void close_connection(struct mg_connection *conn)
 
 void mg_flush_response(struct mg_connection *conn)
 {
+    if (conn == NULL) {
+        return;
+    }
     if (conn->client.sock != INVALID_SOCKET) {
         if (should_keep_alive(conn)) {
             /* Activating Nagle's algorithm implicitly flushes the send buffer */
@@ -9094,41 +9097,43 @@ static void write_non_blocking(struct mg_connection *conn)
 void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t size,
                            void *callback_context, void (*callback)(void *, char))
 {
-    if (conn != NULL) {
-        int epoll_fd = conn->ctx->epoll_fd;
-        if (epoll_fd != -1) {
-            if (conn->client.sock != INVALID_SOCKET) { // Proceed only if no connection failures have been detected yet
-                mg_set_non_blocking(&conn->client, 1);
-                conn->response.buf = buf;
-                conn->response.size = size;
-                conn->response.sent_count = 0;
-                conn->response.callback = callback;
-                conn->response.callback_context = callback_context;
-                conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
-                write_non_blocking(conn);
-            }
+    if (conn == NULL) {
+        return;
+    }
+    int epoll_fd = conn->ctx->epoll_fd;
+    if (epoll_fd != -1) {
+        if (conn->client.sock != INVALID_SOCKET) { // Proceed only if no connection failures have been detected yet
+            mg_set_non_blocking(&conn->client, 1);
+            conn->response.buf = buf;
+            conn->response.size = size;
+            conn->response.sent_count = 0;
+            conn->response.callback = callback;
+            conn->response.callback_context = callback_context;
+            conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
+            write_non_blocking(conn);
         }
     }
 }
 
 void mg_flush_response_non_blocking(struct mg_connection *conn)
 {
-    if (conn != NULL) {
-        int epoll_fd = conn->ctx->epoll_fd;
-        if (epoll_fd != -1) {
-            if (conn->client.sock != INVALID_SOCKET) { // Proceed only if no connection failures have been detected yet
-                if (should_keep_alive(conn)) {
-                    // Re-use the connection. Start it by preparing it to receive a new request.
-                    reset_per_request_attributes(conn);
-                    conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
-                    if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
-                        return;
-                    }
+    if (conn == NULL) {
+        return;
+    }
+    int epoll_fd = conn->ctx->epoll_fd;
+    if (epoll_fd != -1) {
+        if (conn->client.sock != INVALID_SOCKET) { // Proceed only if no connection failures have been detected yet
+            if (should_keep_alive(conn)) {
+                // Re-use the connection. Start it by preparing it to receive a new request.
+                reset_per_request_attributes(conn);
+                conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
+                if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
+                    return;
                 }
-                conn->client.sock = INVALID_SOCKET; // Ensure proper socket closing
-                close_connection(conn);
-                mg_free(conn);
             }
+            conn->client.sock = INVALID_SOCKET; // Ensure proper socket closing
+            close_connection(conn);
+            mg_free(conn);
         }
     }
 }
