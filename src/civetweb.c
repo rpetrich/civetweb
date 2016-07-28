@@ -1217,6 +1217,7 @@ struct mg_connection {
         size_t sent_count;
         void (*callback)(void *, char);
         void *callback_context;
+        bool *is_non_blocking_ptr;
 	} response;
 #endif
 };
@@ -7842,15 +7843,8 @@ static int deprecated_websocket_data_wrapper(
  * This function is called when the request is read, parsed and validated,
  * and Civetweb must decide what action to take: serve a file, or
  * a directory, or call embedded function, etcetera. */
-#if !defined(CIVET_NO_EPOLL)
-// The non_blocking_response argument informs the caller whether the response was sent in a non-blocking manner.
-static void handle_request(struct mg_connection *conn, _Bool *non_blocking_response)
-{
-    *non_blocking_response = 0;
-#else
 static void handle_request(struct mg_connection *conn)
 {
-#endif
     struct mg_request_info *ri = &conn->request_info;
     char path[PATH_MAX];
     int uri_len, ssl_index, is_script_resource, is_websocket_request,
@@ -7918,18 +7912,12 @@ static void handle_request(struct mg_connection *conn)
 
     /* 4. call a "handle everything" callback, if registered */
     if (conn->ctx->callbacks.begin_request != NULL) {
-#if !defined(CIVET_NO_EPOLL)
-        _Bool epoll_available = (conn->ctx->epoll_fd != -1);
-#endif
         /* Note that since V1.7 the "begin_request" function is called
          * before an authorization check. If an authorization check is
          * required, use a request_handler instead. */
         i = conn->ctx->callbacks.begin_request(conn);
         switch (i) {
         case 1:
-#if !defined(CIVET_NO_EPOLL)
-            *non_blocking_response = epoll_available;
-#endif
             /* callback already processed the request */
             return;
         case 0:
@@ -9197,6 +9185,14 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
         conn->response.callback = callback;
         conn->response.callback_context = callback_context;
         conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
+        // Only the first call that happens in a worker thread can pass the info via the worker thread stack variable,
+        // because the variable still exist
+        if (*conn->response.is_non_blocking_ptr) {
+            *conn->response.is_non_blocking_ptr = true; // Pass the info to process_connection
+            // Prevent the consecutive calls that happen asynchronously from passing the info. Firstly it's unnecessary,
+            // secondly by the time of the call the variable might not exist.
+            conn->response.is_non_blocking_ptr = NULL; // Severe the link with the variable that is about to disappear
+        }
         write_non_blocking(conn);
         return;
     }
@@ -9229,7 +9225,7 @@ void mg_flush_response_non_blocking(struct mg_connection *conn)
         close_connection(conn);
         mg_free(conn);
         return;
-}
+    }
 #endif
     // Emulate non-blocking behavior/outcome when the non-blocking functionality is not supported.
     mg_flush_response(conn);
@@ -9662,9 +9658,10 @@ static void process_connection(struct mg_connection *conn)
 
 			if (ebuf[0] == '\0') {
 #if !defined(CIVET_NO_EPOLL)
-				_Bool non_blocking_response;
-			    handle_request(conn, &non_blocking_response);
-			    if (non_blocking_response) {
+				bool is_non_blocking_response = false;
+				conn->response.is_non_blocking_ptr = &is_non_blocking_response;
+			    handle_request(conn);
+			    if (is_non_blocking_response) {
 			        return; // The response was sent in a non-blocking manner, so nothing is left to do here
 			    }
 #else
