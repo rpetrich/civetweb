@@ -9086,7 +9086,7 @@ static void complete_handling_request(struct mg_connection *conn)
 }
 
 // If keep-alive is required, returns 1, otherwise returns 0.
-static bool check_keep_alive_while_discard_buffered_data(struct mg_connection *conn)
+static bool check_keep_alive_while_discarding_buffered_data(struct mg_connection *conn)
 {
     /* NOTE(lsm): order is important here. should_keep_alive() call is
      * using parsed request, which will be invalid after memmove's
@@ -9187,7 +9187,7 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
         conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
         // Only the first call that happens in a worker thread can pass the info via the worker thread stack variable,
         // because the variable still exist
-        if (*conn->response.is_non_blocking_ptr) {
+        if (conn->response.is_non_blocking_ptr) {
             *conn->response.is_non_blocking_ptr = true; // Pass the info to process_connection
             // Prevent the consecutive calls that happen asynchronously from passing the info. Firstly it's unnecessary,
             // secondly by the time of the call the variable might not exist.
@@ -9214,7 +9214,7 @@ void mg_flush_response_non_blocking(struct mg_connection *conn)
         }
         complete_handling_request(conn);
         free_remote_user(conn);
-        if (check_keep_alive_while_discard_buffered_data(conn)) {
+        if (check_keep_alive_while_discarding_buffered_data(conn)) {
             // Return the worker thread to the pool and have the main thread resume processing the keep alive
             reset_per_request_attributes(conn);
             conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
@@ -9673,7 +9673,7 @@ static void process_connection(struct mg_connection *conn)
 			}
 
 		    free_remote_user(conn);
-		    if (!check_keep_alive_while_discard_buffered_data(conn)) {
+		    if (!check_keep_alive_while_discarding_buffered_data(conn)) {
 				break;
 		    }
 			// Return the worker thread to the pool and have the main thread resume processing the keep alive
