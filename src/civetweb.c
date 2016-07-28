@@ -9177,6 +9177,7 @@ static void write_non_blocking(struct mg_connection *conn)
     close_connection(conn);
     mg_free(conn);
 }
+#endif
 
 void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t size,
                            void *callback_context, void (*callback)(void *, char))
@@ -9184,6 +9185,7 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
     if (conn == NULL) {
         return;
     }
+#if !defined(CIVET_NO_EPOLL)
     if (conn->ctx->epoll_fd != -1) {
         if (conn->client.sock == INVALID_SOCKET) {
             return; // It's a mistake to call this function after the socket has failed, so do nothing.
@@ -9196,7 +9198,12 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
         conn->response.callback_context = callback_context;
         conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
         write_non_blocking(conn);
+        return;
     }
+#endif
+    // Emulate non-blocking behavior/outcome when the non-blocking functionality is not supported.
+    mg_write(conn, buf, size);
+    (*callback)(callback_context, 1);
 }
 
 void mg_flush_response_non_blocking(struct mg_connection *conn)
@@ -9204,6 +9211,7 @@ void mg_flush_response_non_blocking(struct mg_connection *conn)
     if (conn == NULL) {
         return;
     }
+#if !defined(CIVET_NO_EPOLL)
     if (conn->ctx->epoll_fd != -1) {
         if (conn->client.sock == INVALID_SOCKET) {
             return; // It's a mistake to call this function after the socket has failed, so do nothing.
@@ -9220,9 +9228,12 @@ void mg_flush_response_non_blocking(struct mg_connection *conn)
         }
         close_connection(conn);
         mg_free(conn);
-    }
+        return;
 }
 #endif
+    // Emulate non-blocking behavior/outcome when the non-blocking functionality is not supported.
+    mg_flush_response(conn);
+}
 
 void mg_finish(struct mg_connection *conn)
 {
