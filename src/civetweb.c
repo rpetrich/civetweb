@@ -8914,29 +8914,26 @@ static int set_sock_timeout(SOCKET sock, int milliseconds)
 }
 
 #if !defined(CIVET_NO_EPOLL)
-static int schedule_event_for_epoll_op(struct mg_connection *conn, uint32_t events, struct epoll_event *e_event)
+static int schedule_event_for_epoll_op(int epoll_fd, struct mg_connection *conn, uint32_t events, struct epoll_event *e_event)
 {
-	int epoll_fd = conn->ctx->epoll_fd;
-	if (epoll_fd == -1) {
-		return -1;
-	}
-	// EPOLLERR is always reported, so we don't need to specify it here, but, because of a bug in some old Linux versions
-	// it wasn't the case, let's do it anyway, just in case.
+    assert(epoll_fd != -1); // Caller must call this function only when epoll_fd is valid
+    // EPOLLERR is always reported, so we don't need to specify it here, but, because of a bug in some old Linux
+    // versions it wasn't the case, let's do it anyway, just in case.
     e_event->events = events | EPOLLONESHOT | EPOLLERR;
-	if (conn->was_epoll_scheduled) {
-		return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->client.sock, e_event);
-	} else {
-		// Set before scheduling, to avoid a data race
-		conn->was_epoll_scheduled = 1;
-		return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->client.sock, e_event);
-	}
+    if (conn->was_epoll_scheduled) {
+        return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->client.sock, e_event);
+    }
+    // Set before scheduling, to avoid a data race
+    conn->was_epoll_scheduled = 1;
+    return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->client.sock, e_event);
 }
 
-static int schedule_for_epoll_op(struct mg_connection *conn, uint32_t events)
+static int schedule_for_epoll_op(int epoll_fd, struct mg_connection *conn, uint32_t events)
 {
+    assert(epoll_fd != -1); // Caller must call this function only when epoll_fd is valid
     struct epoll_event e_event;
     e_event.data.ptr = conn;
-    return schedule_event_for_epoll_op(conn, events, &e_event);
+    return schedule_event_for_epoll_op(epoll_fd, conn, events, &e_event);
 }
 #endif
 
@@ -8973,18 +8970,21 @@ static void close_socket_gracefully(struct mg_connection *conn)
 #else
 	int err = shutdown(socket_fd, SHUT_RDWR);
 	if (err == 0 || errno != ENOTCONN) {
-		struct mg_epoll_event_close_socket *data = mg_calloc(sizeof(*data), 1);
-		if (data) {
-			data->header.type = EPOLL_DATA_TYPE_CLOSE_SOCKET;
-			data->socket = socket_fd;
-			struct epoll_event event;
-			event.data.ptr = data;
-			if (schedule_event_for_epoll_op(conn, 0, &event) != -1) {
-				conn->client.sock = INVALID_SOCKET;
-				return;
-			}
-			mg_free(data);
-		}
+	    int epoll_fd = conn->ctx->epoll_fd;
+	    if (epoll_fd != -1) {
+            struct mg_epoll_event_close_socket *data = mg_calloc(sizeof(*data), 1);
+            if (data) {
+                data->header.type = EPOLL_DATA_TYPE_CLOSE_SOCKET;
+                data->socket = socket_fd;
+                struct epoll_event event;
+                event.data.ptr = data;
+                if (schedule_event_for_epoll_op(epoll_fd, conn, 0, &event) != -1) {
+                    conn->client.sock = INVALID_SOCKET;
+                    return;
+                }
+                mg_free(data);
+            }
+	    }
 	}
 #endif
 	mg_set_non_blocking(&conn->client, 1);
@@ -9120,7 +9120,8 @@ static bool check_keep_alive_while_discarding_buffered_data(struct mg_connection
 
 #if !defined(CIVET_NO_EPOLL)
 static int prepare_connection_for_new_request(struct mg_connection *conn) {
-    if (conn->ctx->epoll_fd != -1) {
+    int epoll_fd = conn->ctx->epoll_fd;
+    if (epoll_fd != -1) {
         // Speculatively try to read the next request
         mg_set_non_blocking(&conn->client, 1);
         sched_yield();
@@ -9131,7 +9132,7 @@ static int prepare_connection_for_new_request(struct mg_connection *conn) {
             conn->data_len = data_len;
         }
         if (get_request_len(conn->buf, data_len) == 0) {
-            if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
+            if (schedule_for_epoll_op(epoll_fd, conn, EPOLLIN) != -1) {
                 return 1;
             }
         }
@@ -9139,8 +9140,9 @@ static int prepare_connection_for_new_request(struct mg_connection *conn) {
     return 0;
 }
 
-static void write_non_blocking(struct mg_connection *conn)
+static void write_non_blocking(int epoll_fd, struct mg_connection *conn)
 {
+    assert(epoll_fd != -1); // Caller must call this function only when epoll_fd is valid
     if (conn->client.sock != INVALID_SOCKET) {
         size_t size = conn->response.size - conn->response.sent_count;
         const void *buf = (char *)conn->response.buf + conn->response.sent_count;
@@ -9153,7 +9155,7 @@ static void write_non_blocking(struct mg_connection *conn)
         }
         if (sent_count != -1) { // Some data have been sent successfully, but not all, so send the rest with epoll
             conn->response.sent_count += sent_count;
-            if (schedule_for_epoll_op(conn, EPOLLOUT) != -1) {
+            if (schedule_for_epoll_op(epoll_fd, conn, EPOLLOUT) != -1) {
                 return; // Success. The data sending is underway using epoll
             }
         }
@@ -9174,7 +9176,8 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
         return;
     }
 #if !defined(CIVET_NO_EPOLL)
-    if (conn->ctx->epoll_fd != -1) {
+    int epoll_fd = conn->ctx->epoll_fd;
+    if (epoll_fd != -1) {
         if (conn->client.sock == INVALID_SOCKET) {
             return; // It's a mistake to call this function after the socket has failed, so do nothing.
         }
@@ -9193,7 +9196,7 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
             // secondly by the time of the call the variable might not exist.
             conn->response.is_non_blocking_ptr = NULL; // Severe the link with the variable that is about to disappear
         }
-        write_non_blocking(conn);
+        write_non_blocking(epoll_fd, conn);
         return;
     }
 #endif
@@ -9917,9 +9920,12 @@ static void accept_new_connection(const struct socket *listener,
 			   ) {
 				mg_atomic_inc(&ctx->live_sockets);
 #if !defined(CIVET_NO_EPOLL)
-				conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
-				if (schedule_for_epoll_op(conn, EPOLLIN) != -1) {
-					return;
+				int epoll_fd = ctx->epoll_fd;
+				if (epoll_fd != -1) {
+                    conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
+                    if (schedule_for_epoll_op(epoll_fd, conn, EPOLLIN) != -1) {
+                        return;
+                    }
 				}
 #endif
 				produce_socket(ctx, conn);
@@ -9972,7 +9978,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 						produce_socket(ctx, conn);
 					} else {
 						// Ask for more data as it comes in
-						if (schedule_event_for_epoll_op(conn, EPOLLIN, event) == -1) {
+						if (schedule_event_for_epoll_op(ctx->epoll_fd, conn, EPOLLIN, event) == -1) {
 							// Failed to schedule, just let a worker handle it
 							produce_socket(ctx, conn);
 						}
@@ -9989,7 +9995,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
             if (!(event->events & EPOLLOUT)) { // Note that if it's not EPOLLOUT, then it's EPOLLERR | EPOLLHUP
                 conn->client.sock = INVALID_SOCKET; // Prevent further non-blocking calls and ensure proper socket closing
             }
-            write_non_blocking(conn);
+            write_non_blocking(ctx->epoll_fd, conn);
         }
 	}
 }
@@ -10227,8 +10233,9 @@ void mg_stop(struct mg_context *ctx)
 	}
 
 #if !defined(CIVET_NO_EPOLL)
-	if (ctx->epoll_fd != -1) {
-		close(ctx->epoll_fd);
+    int epoll_fd = ctx->epoll_fd;
+    if (epoll_fd != -1) {
+		close(epoll_fd);
 	}
 #endif
 
