@@ -159,6 +159,7 @@ static int clock_gettime(int clk_id, struct timespec *t)
 }
 #endif
 
+#include <stdbool.h>
 #include <time.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -9097,14 +9098,14 @@ static void complete_handling_request(struct mg_connection *conn)
 }
 
 // If keep-alive is required, returns 1, otherwise returns 0.
-static int check_keep_alive_while_discard_buffered_data(struct mg_connection *conn)
+static bool check_keep_alive_while_discard_buffered_data(struct mg_connection *conn)
 {
     /* NOTE(lsm): order is important here. should_keep_alive() call is
      * using parsed request, which will be invalid after memmove's
      * below.
      * Therefore, memorize should_keep_alive() result now for later use
      * in loop exit condition. */
-    int keep_alive = conn->ctx->stop_flag == 0 && conn->content_len >= 0 && should_keep_alive(conn);
+    bool keep_alive = conn->ctx->stop_flag == 0 && conn->content_len >= 0 && should_keep_alive(conn);
 
     /* Discard all buffered data for this request */
     int discard_len = conn->content_len >= 0 && conn->request_len > 0 &&
@@ -9124,7 +9125,7 @@ static int check_keep_alive_while_discard_buffered_data(struct mg_connection *co
     /* assert(conn->data_len <= conn->buf_size); */
 
     if ((conn->data_len < 0) || (conn->data_len > MAX_REQUEST_SIZE))
-        return 0;
+        return false;
 
     return keep_alive;
 }
