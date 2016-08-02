@@ -1173,6 +1173,7 @@ struct mg_connection {
 #if !defined(CIVET_NO_EPOLL)
 	struct mg_epoll_event_header event_header;
 	bool was_epoll_scheduled;
+	bool is_good; // This flag indicates whether the epoll or send functionality has failed
 #endif
 	struct mg_request_info request_info;
 	struct mg_context *ctx;
@@ -1217,7 +1218,6 @@ struct mg_connection {
         size_t sent_count;
         void (*callback)(void *, char);
         void *callback_context;
-        bool *is_non_blocking_ptr;
 	} response;
 #endif
 };
@@ -3934,7 +3934,8 @@ interpret_uri(struct mg_connection *conn,   /* in: request */
 /* Check whether full request is buffered. Return:
  * -1  if request is malformed
  *  0  if request is not yet fully buffered
- * >0  actual request length, including last \r\n\r\n */
+ * >0  actual request length, including last \r\n\r\n
+ * NOTE: POST requests are NOT supported! ONLY HTTP headers are being parsed! */
 static int get_request_len(const char *buf, int buflen)
 {
 	const char *s, *e;
@@ -5482,7 +5483,8 @@ static int parse_http_message(char *buf, int len, struct mg_request_info *ri)
  * or SSL descriptor ssl) into buffer buf, until \r\n\r\n appears in the
  * buffer (which marks the end of HTTP request). Buffer buf may already
  * have some data. The length of the data is stored in nread.
- * Upon every read operation, increase nread by the number of bytes read. */
+ * Upon every read operation, increase nread by the number of bytes read.
+ * NOTE: POST requests are NOT supported! ONLY HTTP headers are being read! */
 static int read_request(
     FILE *fp, struct mg_connection *conn, char *buf, int bufsiz, int *nread)
 {
@@ -7839,6 +7841,9 @@ static int deprecated_websocket_data_wrapper(
 }
 #endif
 
+static void complete_request(struct mg_connection *conn);
+static void produce_socket(struct mg_context *ctx, struct mg_connection *cp);
+
 /* This is the heart of the Civetweb's logic.
  * This function is called when the request is read, parsed and validated,
  * and Civetweb must decide what action to take: serve a file, or
@@ -7903,7 +7908,7 @@ static void handle_request(struct mg_connection *conn)
                             "Error: SSL forward not configured properly");
             mg_cry(conn, "Can not redirect to SSL, no SSL port available");
         }
-        return;
+        goto complete_request;
     }
 
     /* 3. if this ip has limited speed, set it for this connection */
@@ -7925,7 +7930,7 @@ static void handle_request(struct mg_connection *conn)
             break;
         default:
             /* unspecified - may change with the next version */
-            return;
+            goto complete_request;
         }
     }
 
@@ -7989,14 +7994,14 @@ static void handle_request(struct mg_connection *conn)
                             405,
                             "%s method not allowed",
                             conn->request_info.request_method);
-            return;
+            goto complete_request;
         }
 
         /* 6.1.2. Check if put authorization for static files is available.
          */
         if (!is_authorized_for_put(conn)) {
             send_authorization_request(conn);
-            return;
+            goto complete_request;
         }
 
     } else {
@@ -8005,7 +8010,7 @@ static void handle_request(struct mg_connection *conn)
          * correspond to a file. Check authorization. */
         if (!check_authorization(conn, path)) {
             send_authorization_request(conn);
-            return;
+            goto complete_request;
         }
     }
 
@@ -8049,7 +8054,7 @@ static void handle_request(struct mg_connection *conn)
                                      callback_data);
 #endif
         }
-        return;
+        goto complete_request;
     }
 
 /* 8. handle websocket requests */
@@ -8064,7 +8069,7 @@ static void handle_request(struct mg_connection *conn)
             deprecated_websocket_data_wrapper,
             NULL,
             &conn->ctx->callbacks);
-        return;
+        goto complete_request;
     } else
 #endif
 
@@ -8078,13 +8083,13 @@ static void handle_request(struct mg_connection *conn)
      * by a script file. Thus, a DOCUMENT_ROOT must exist. */
     if (conn->ctx->config[DOCUMENT_ROOT] == NULL) {
         send_http_error(conn, 404, "%s", "Not Found");
-        return;
+        goto complete_request;
     }
 
     /* 10. File is handled by a script. */
     if (is_script_resource) {
         handle_file_based_request(conn, path, &file);
-        return;
+        goto complete_request;
     }
 
     /* 11. Handle put/delete/mkcol requests */
@@ -8092,24 +8097,24 @@ static void handle_request(struct mg_connection *conn)
         /* 11.1. PUT method */
         if (!strcmp(ri->request_method, "PUT")) {
             put_file(conn, path);
-            return;
+            goto complete_request;
         }
         /* 11.2. DELETE method */
         if (!strcmp(ri->request_method, "DELETE")) {
             delete_file(conn, path);
-            return;
+            goto complete_request;
         }
         /* 11.3. MKCOL method */
         if (!strcmp(ri->request_method, "MKCOL")) {
             mkcol(conn, path);
-            return;
+            goto complete_request;
         }
         /* 11.4. should never reach this point */
         send_http_error(conn,
                         405,
                         "%s method not allowed",
                         conn->request_info.request_method);
-        return;
+        goto complete_request;
     }
 
     /* 11. File does not exist, or it was configured that it should be
@@ -8117,7 +8122,7 @@ static void handle_request(struct mg_connection *conn)
     if (((file.membuf == NULL) && (file.modification_time == (time_t)0)) ||
         (must_hide_file(conn, path))) {
         send_http_error(conn, 404, "%s", "Not found");
-        return;
+        goto complete_request;
     }
 
     /* 12. Directories uris should end with a slash */
@@ -8133,14 +8138,14 @@ static void handle_request(struct mg_connection *conn)
                   ri->uri,
                   date,
                   suggest_connection_header(conn));
-        return;
+        goto complete_request;
     }
 
     /* 13. Handle other methods than GET/HEAD */
     /* 13.1. Handle PROPFIND */
     if (!strcmp(ri->request_method, "PROPFIND")) {
         handle_propfind(conn, path, &file);
-        return;
+        goto complete_request;
     }
     /* 13.2. Handle OPTIONS for files */
     if (!strcmp(ri->request_method, "OPTIONS")) {
@@ -8150,7 +8155,7 @@ static void handle_request(struct mg_connection *conn)
          * Lua and CGI scripts may fully support CORS this way (including
          * preflights). */
         send_options(conn);
-        return;
+        goto complete_request;
     }
     /* 13.3. everything but GET and HEAD (e.g. POST) */
     if (0 != strcmp(ri->request_method, "GET") &&
@@ -8159,7 +8164,7 @@ static void handle_request(struct mg_connection *conn)
                         405,
                         "%s method not allowed",
                         conn->request_info.request_method);
-        return;
+        goto complete_request;
     }
 
     /* 14. directories */
@@ -8177,7 +8182,7 @@ static void handle_request(struct mg_connection *conn)
                 send_http_error(
                     conn, 403, "%s", "Error: Directory listing denied");
             }
-            return;
+            goto complete_request;
         }
     }
 
@@ -8190,6 +8195,8 @@ static void handle_request(struct mg_connection *conn)
          * Otherwise, begin_request() would need to perform auth checks and
          * redirects. */
 #endif
+complete_request:
+    complete_request(conn);
 }
 
 static void handle_file_based_request(struct mg_connection *conn,
@@ -9053,17 +9060,7 @@ void mg_flush_response(struct mg_connection *conn)
     if (conn == NULL) {
         return;
     }
-    if (conn->client.sock != INVALID_SOCKET) {
-        if (should_keep_alive(conn)) {
-            /* Activating Nagle's algorithm implicitly flushes the send buffer */
-            if (mg_set_no_delay(&conn->client, 1) == 0) {
-                return;
-            }
-        }
-        /* And if the client connection doesn't support keep alive,
-         * the connection must be closed to do a flush */
-        close_connection(conn);
-    }
+    complete_request(conn);
 }
 
 static void free_remote_user(struct mg_connection *conn)
@@ -9077,17 +9074,15 @@ static void free_remote_user(struct mg_connection *conn)
     }
 }
 
-static void complete_handling_request(struct mg_connection *conn)
+static void complete_request(struct mg_connection *conn)
 {
     if (conn->ctx->callbacks.end_request != NULL) {
         conn->ctx->callbacks.end_request(conn, conn->status_code);
     }
     log_access(conn);
-}
 
-// If keep-alive is required, returns 1, otherwise returns 0.
-static bool check_keep_alive_while_discarding_buffered_data(struct mg_connection *conn)
-{
+    free_remote_user(conn);
+
     /* NOTE(lsm): order is important here. should_keep_alive() call is
      * using parsed request, which will be invalid after memmove's
      * below.
@@ -9097,53 +9092,54 @@ static bool check_keep_alive_while_discarding_buffered_data(struct mg_connection
 
     /* Discard all buffered data for this request */
     int discard_len = conn->content_len >= 0 && conn->request_len > 0 &&
-                          conn->request_len + conn->content_len <
-                              (int64_t)conn->data_len
+                      conn->request_len + conn->content_len < (int64_t)conn->data_len
                       ? (int)(conn->request_len + conn->content_len)
                       : conn->data_len;
     /*assert(discard_len >= 0);*/
-    if (discard_len < 0)
-        return 0;
+    if (discard_len < 0) { // Impossible, but check just in case
+        goto destroy_connection;
+    }
     conn->data_len -= discard_len;
-    if (conn->data_len > 0)
-        memmove(
-            conn->buf, conn->buf + discard_len, (size_t)conn->data_len);
+    if (conn->data_len > 0) { // If further request(s) are already queuing up, move them to the head of the queue
+        memmove(conn->buf, conn->buf + discard_len, (size_t)conn->data_len);
+    }
 
     /* assert(conn->data_len >= 0); */
     /* assert(conn->data_len <= conn->buf_size); */
-
-    if ((conn->data_len < 0) || (conn->data_len > MAX_REQUEST_SIZE))
-        return false;
-
-    return keep_alive;
+    if ((conn->data_len < 0) || (conn->data_len > MAX_REQUEST_SIZE)) { // Impossible, but check just in case
+        goto destroy_connection;
+    }
+    if (keep_alive) {
+        /* Activating Nagle's algorithm implicitly flushes the send buffer */
+        if (mg_set_no_delay(&conn->client, 1) != 0) { // Impossible, but check just in case
+            goto destroy_connection;
+        }
+        reset_per_request_attributes(conn);
+#if !defined(CIVET_NO_EPOLL)
+        conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
+        int epoll_fd = conn->ctx->epoll_fd;
+        if (epoll_fd != -1) {
+            if (get_request_len(conn->buf, conn->data_len) == 0) { // The next request isn't (fully) received yet
+                // Ask for more data as it comes in
+                if (schedule_for_epoll_op(epoll_fd, conn, EPOLLIN) != -1) {
+                    return; // The non-blocking request receiving was successfully scheduled
+                }
+            }
+        }
+#endif
+        produce_socket(conn->ctx, conn);
+        return;
+    }
+destroy_connection:
+    close_connection(conn);
+    mg_free(conn);
 }
 
 #if !defined(CIVET_NO_EPOLL)
-static int prepare_connection_for_new_request(struct mg_connection *conn) {
-    int epoll_fd = conn->ctx->epoll_fd;
-    if (epoll_fd != -1) {
-        // Speculatively try to read the next request
-        mg_set_non_blocking(&conn->client, 1);
-        sched_yield();
-        int data_len = conn->data_len;
-        int n = (int)recv(conn->client.sock, conn->buf + data_len, (size_t)MAX_REQUEST_SIZE - data_len, 0);
-        if (n > 0) {
-            data_len += n;
-            conn->data_len = data_len;
-        }
-        if (get_request_len(conn->buf, data_len) == 0) {
-            if (schedule_for_epoll_op(epoll_fd, conn, EPOLLIN) != -1) {
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
 static void write_non_blocking(int epoll_fd, struct mg_connection *conn)
 {
     assert(epoll_fd != -1); // Caller must call this function only when epoll_fd is valid
-    if (conn->client.sock != INVALID_SOCKET) {
+    if (conn->is_good) { // No failure has been detected yet, so let's proceed with writing
         size_t size = conn->response.size - conn->response.sent_count;
         const void *buf = (char *)conn->response.buf + conn->response.sent_count;
         // First try to send the the data w/o using epoll. If the data are short, it will be most efficient way.
@@ -9159,7 +9155,7 @@ static void write_non_blocking(int epoll_fd, struct mg_connection *conn)
                 return; // Success. The data sending is underway using epoll
             }
         }
-        conn->client.sock = INVALID_SOCKET; // Prevent further non-blocking calls and ensure proper socket closing
+        conn->is_good = false; // Connection is no longer viable because of the send/epoll errors
     }
     // One way or another the sending has failed
     (*conn->response.callback)(conn->response.callback_context, 0); // Should do a cleanup and must call no non-blocking functions.
@@ -9178,8 +9174,8 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
 #if !defined(CIVET_NO_EPOLL)
     int epoll_fd = conn->ctx->epoll_fd;
     if (epoll_fd != -1) {
-        if (conn->client.sock == INVALID_SOCKET) {
-            return; // It's a mistake to call this function after the socket has failed, so do nothing.
+        if (!conn->is_good) {
+            return; // It's a mistake to call this function after the connection has failed, so do nothing.
         }
         mg_set_non_blocking(&conn->client, 1);
         conn->response.buf = buf;
@@ -9188,14 +9184,6 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
         conn->response.callback = callback;
         conn->response.callback_context = callback_context;
         conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
-        // Only the first call that happens in a worker thread can pass the info via the worker thread stack variable,
-        // because the variable still exist
-        if (conn->response.is_non_blocking_ptr) {
-            *conn->response.is_non_blocking_ptr = true; // Pass the info to process_connection
-            // Prevent the consecutive calls that happen asynchronously from passing the info. Firstly it's unnecessary,
-            // secondly by the time of the call the variable might not exist.
-            conn->response.is_non_blocking_ptr = NULL; // Severe the link with the variable that is about to disappear
-        }
         write_non_blocking(epoll_fd, conn);
         return;
     }
@@ -9212,21 +9200,10 @@ void mg_flush_response_non_blocking(struct mg_connection *conn)
     }
 #if !defined(CIVET_NO_EPOLL)
     if (conn->ctx->epoll_fd != -1) {
-        if (conn->client.sock == INVALID_SOCKET) {
-            return; // It's a mistake to call this function after the socket has failed, so do nothing.
+        if (!conn->is_good) {
+            return; // It's a mistake to call this function after the connection has failed, so do nothing.
         }
-        complete_handling_request(conn);
-        free_remote_user(conn);
-        if (check_keep_alive_while_discarding_buffered_data(conn)) {
-            // Return the worker thread to the pool and have the main thread resume processing the keep alive
-            reset_per_request_attributes(conn);
-            conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
-            if (prepare_connection_for_new_request(conn)) {
-                return;
-            }
-        }
-        close_connection(conn);
-        mg_free(conn);
+        complete_request(conn);
         return;
     }
 #endif
@@ -9631,65 +9608,40 @@ mg_connect_websocket_client(const char *host,
 	return conn;
 }
 
-static void process_connection(struct mg_connection *conn)
+static bool parse_request(struct mg_connection *conn)
 {
-	if (conn && conn->ctx) {
-		struct mg_request_info *ri = &conn->request_info;
-		char ebuf[100];
-		int reqerr;
-
-		for (;;) {
-			if (!getreq(conn, ebuf, sizeof(ebuf), &reqerr)) {
-				/* The request sent by the client could not be understood by
-				 * the server, or it was incomplete or a timeout. Send an
-				 * error message and close the connection. */
-				if (reqerr > 0) {
-					/*assert(ebuf[0] != '\0');*/
-					send_http_error(conn, reqerr, "%s", ebuf);
-				}
-			} else if (!is_valid_uri(conn->request_info.uri)) {
-				snprintf(ebuf, sizeof(ebuf), "Invalid URI: [%s]", ri->uri);
-				send_http_error(conn, 400, "%s", ebuf);
-			} else if (strcmp(ri->http_version, "1.0") &&
-			           strcmp(ri->http_version, "1.1")) {
-				snprintf(ebuf,
-				         sizeof(ebuf),
-				         "Bad HTTP version: [%s]",
-				         ri->http_version);
-				send_http_error(conn, 505, "%s", ebuf);
-			}
-
-			if (ebuf[0] == '\0') {
-#if !defined(CIVET_NO_EPOLL)
-				bool is_non_blocking_response = false;
-				conn->response.is_non_blocking_ptr = &is_non_blocking_response;
-			    handle_request(conn);
-			    if (is_non_blocking_response) {
-			        return; // The response was sent in a non-blocking manner, so nothing is left to do here
-			    }
-#else
-                handle_request(conn);
-#endif
-	            complete_handling_request(conn);
-			} else {
-				conn->must_close = 1;
-			}
-
-		    free_remote_user(conn);
-		    if (!check_keep_alive_while_discarding_buffered_data(conn)) {
-				break;
-		    }
-			// Return the worker thread to the pool and have the main thread resume processing the keep alive
-		    reset_per_request_attributes(conn);
-#if !defined(CIVET_NO_EPOLL)
-            if (prepare_connection_for_new_request(conn)) {
-                return; // The non-blocking request receiving was successfully scheduled, so nothing is left to do here
-            }
-#endif
-		} // for
-	}
-	close_connection(conn);
-	mg_free(conn);
+    if (conn == NULL) {
+        return false;
+    }
+    struct mg_request_info *ri = &conn->request_info;
+    char ebuf[100];
+    int reqerr;
+    if (!getreq(conn, ebuf, sizeof(ebuf), &reqerr)) {
+        /* The request sent by the client could not be understood by
+         * the server, or it was incomplete or a timeout. Send an
+         * error message and close the connection. */
+        if (reqerr > 0) {
+            /*assert(ebuf[0] != '\0');*/
+            send_http_error(conn, reqerr, "%s", ebuf);
+        }
+    } else if (!is_valid_uri(ri->uri)) {
+        snprintf(ebuf, sizeof(ebuf), "Invalid URI: [%s]", ri->uri);
+        send_http_error(conn, 400, "%s", ebuf);
+    } else if (strcmp(ri->http_version, "1.0") &&
+               strcmp(ri->http_version, "1.1")) {
+        snprintf(ebuf,
+                 sizeof(ebuf),
+                 "Bad HTTP version: [%s]",
+                 ri->http_version);
+        send_http_error(conn, 505, "%s", ebuf);
+    } else {
+        return true;
+    }
+    conn->must_close = 1;
+    free_remote_user(conn);
+    close_connection(conn);
+    mg_free(conn);
+    return false;
 }
 
 /* Worker threads take accepted socket from the queue */
@@ -9753,7 +9705,9 @@ static void *worker_thread_run(void *thread_func_param)
 	 * signal sq_empty condvar to wake up the master waiting in
 	 * produce_socket() */
 	while (consume_socket(ctx, &conn)) {
-		process_connection(conn);
+	    if (parse_request(conn)) {
+	        handle_request(conn);
+	    }
 	}
 
 	/* Signal that we're done processing connections and will exit */
@@ -9924,6 +9878,7 @@ static void accept_new_connection(const struct socket *listener,
 				if (epoll_fd != -1) {
                     conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
                     conn->was_epoll_scheduled = false;
+                    conn->is_good = true;
                     if (schedule_for_epoll_op(epoll_fd, conn, EPOLLIN) != -1) {
                         return;
                     }
@@ -9994,7 +9949,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
         case EPOLL_DATA_TYPE_WRITE_RESPONSE: {
             struct mg_connection *conn = event->data.ptr;
             if (!(event->events & EPOLLOUT)) { // Note that if it's not EPOLLOUT, then it's EPOLLERR | EPOLLHUP
-                conn->client.sock = INVALID_SOCKET; // Prevent further non-blocking calls and ensure proper socket closing
+                conn->is_good = false; // Connection is no longer viable because of the epoll errors
             }
             write_non_blocking(ctx->epoll_fd, conn);
         }
