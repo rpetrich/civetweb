@@ -3083,7 +3083,7 @@ static int set_non_blocking_mode(SOCKET sock, int enabled)
 }
 #endif /* _WIN32 */
 
-static int mg_set_non_blocking(struct socket *s, int enabled)
+static int set_non_blocking(struct socket *s, int enabled)
 {
 	if (s->is_non_blocking == enabled)
 		return 0;
@@ -3094,7 +3094,7 @@ static int mg_set_non_blocking(struct socket *s, int enabled)
 	return result;
 }
 
-static int mg_set_no_delay(struct socket *s, int enabled)
+static int set_no_delay(struct socket *s, int enabled)
 {
 	if (s->is_no_delay == enabled)
 		return 0;
@@ -3157,7 +3157,7 @@ static int pull(FILE *fp, struct mg_connection *conn, char *buf, int len)
 		memset(&now, 0, sizeof(now));
 	}
 
-	mg_set_non_blocking(&conn->client, 0);
+	set_non_blocking(&conn->client, 0);
 
 	do {
 		if (fp != NULL) {
@@ -3399,7 +3399,7 @@ int mg_write(struct mg_connection *conn, const void *buf, size_t len)
 	}
 
 	if (conn->throttle > 0) {
-		mg_set_non_blocking(&conn->client, 0);
+		set_non_blocking(&conn->client, 0);
 		if ((now = time(NULL)) != conn->last_throttle_time) {
 			conn->last_throttle_time = now;
 			conn->last_throttle_bytes = 0;
@@ -3442,7 +3442,7 @@ int mg_write(struct mg_connection *conn, const void *buf, size_t len)
 		if ((total < (int64_t)len) && conn->client.is_non_blocking) {
 			err = ERRNO;
 			if ((err == EWOULDBLOCK) || (err == ENOBUFS) || (err == EAGAIN)) {
-				mg_set_non_blocking(&conn->client, 0);
+				set_non_blocking(&conn->client, 0);
 				total += push(NULL,
 				             conn->client.sock,
 				             conn->ssl,
@@ -8455,7 +8455,7 @@ static int set_ports_option(struct mg_context *ctx)
 			} else {
 				so.is_non_blocking = 0;
 				so.is_no_delay = 0;
-				mg_set_non_blocking(&so, 1);
+				set_non_blocking(&so, 1);
 #if !defined(CIVET_NO_CLOEXEC)
 				set_close_on_exec(so.sock, fc(ctx));
 #endif
@@ -8994,7 +8994,7 @@ static void close_socket_gracefully(struct mg_connection *conn)
 	    }
 	}
 #endif
-	mg_set_non_blocking(&conn->client, 1);
+	set_non_blocking(&conn->client, 1);
 	conn->client.sock = INVALID_SOCKET;
 
 #if defined(_WIN32)
@@ -9111,9 +9111,7 @@ static void complete_request(struct mg_connection *conn)
     }
     if (keep_alive) {
         /* Activating Nagle's algorithm implicitly flushes the send buffer */
-        if (mg_set_no_delay(&conn->client, 1) != 0) { // Impossible, but check just in case
-            goto destroy_connection;
-        }
+        set_no_delay(&conn->client, 1); // Since we are not closing the socket, set "no delay", which will flush its buffer
         reset_per_request_attributes(conn);
 #if !defined(CIVET_NO_EPOLL)
         conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
@@ -9177,7 +9175,7 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
         if (!conn->is_good) {
             return; // It's a mistake to call this function after the connection has failed, so do nothing.
         }
-        mg_set_non_blocking(&conn->client, 1);
+        set_non_blocking(&conn->client, 1);
         conn->response.buf = buf;
         conn->response.size = size;
         conn->response.sent_count = 0;
@@ -9918,7 +9916,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 		case EPOLL_DATA_TYPE_READ_REQUEST: {
 			struct mg_connection *conn = event->data.ptr;
 			if (event->events & EPOLLIN) {
-				mg_set_non_blocking(&conn->client, 1);
+				set_non_blocking(&conn->client, 1);
 				int data_len = conn->data_len;
 				int n = (int)recv(conn->client.sock, conn->buf + data_len, (size_t)MAX_REQUEST_SIZE - data_len, 0);
 				if (n < 0) {
