@@ -1172,7 +1172,7 @@ struct mg_context {
 struct mg_connection {
 #if !defined(CIVET_NO_EPOLL)
 	struct mg_epoll_event_header event_header;
-	int was_epoll_scheduled;
+	bool was_epoll_scheduled;
 #endif
 	struct mg_request_info request_info;
 	struct mg_context *ctx;
@@ -8924,7 +8924,7 @@ static int schedule_event_for_epoll_op(int epoll_fd, struct mg_connection *conn,
         return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->client.sock, e_event);
     }
     // Set before scheduling, to avoid a data race
-    conn->was_epoll_scheduled = 1;
+    conn->was_epoll_scheduled = true;
     return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->client.sock, e_event);
 }
 
@@ -9923,6 +9923,7 @@ static void accept_new_connection(const struct socket *listener,
 				int epoll_fd = ctx->epoll_fd;
 				if (epoll_fd != -1) {
                     conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
+                    conn->was_epoll_scheduled = false;
                     if (schedule_for_epoll_op(epoll_fd, conn, EPOLLIN) != -1) {
                         return;
                     }
