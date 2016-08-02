@@ -1173,7 +1173,6 @@ struct mg_connection {
 #if !defined(CIVET_NO_EPOLL)
 	struct mg_epoll_event_header event_header;
 	bool was_epoll_scheduled;
-	bool is_good; // This flag indicates whether the epoll or send functionality has failed
 #endif
 	struct mg_request_info request_info;
 	struct mg_context *ctx;
@@ -1216,7 +1215,7 @@ struct mg_connection {
         const void* buf;
         size_t size;
         size_t sent_count;
-        void (*callback)(void *, char);
+        void (*callback)(struct mg_connection *conn, void *);
         void *callback_context;
 	} response;
 #endif
@@ -9134,17 +9133,17 @@ destroy_connection:
 }
 
 #if !defined(CIVET_NO_EPOLL)
-static void write_non_blocking(int epoll_fd, struct mg_connection *conn)
+static void write_non_blocking(int epoll_fd, struct mg_connection *conn, bool is_connection_good)
 {
     assert(epoll_fd != -1); // Caller must call this function only when epoll_fd is valid
-    if (conn->is_good) { // No failure has been detected yet, so let's proceed with writing
+    if (is_connection_good) {
         size_t size = conn->response.size - conn->response.sent_count;
         const void *buf = (char *)conn->response.buf + conn->response.sent_count;
         // First try to send the the data w/o using epoll. If the data are short, it will be most efficient way.
         ssize_t sent_count = send(conn->client.sock, buf, size, MSG_NOSIGNAL);
         if ((size_t)sent_count == size) { // We are lucky, we managed to send everything at once w/o further epoll.
             // The caller must call either non-blocking flush or, if there is more data, non-blocking write.
-            (*conn->response.callback)(conn->response.callback_context, 1);
+            (*conn->response.callback)(conn, conn->response.callback_context);
             return; // Success. Everything is done
         }
         if (sent_count != -1) { // Some data have been sent successfully, but not all, so send the rest with epoll
@@ -9153,10 +9152,9 @@ static void write_non_blocking(int epoll_fd, struct mg_connection *conn)
                 return; // Success. The data sending is underway using epoll
             }
         }
-        conn->is_good = false; // Connection is no longer viable because of the send/epoll errors
     }
     // One way or another the sending has failed
-    (*conn->response.callback)(conn->response.callback_context, 0); // Should do a cleanup and must call no non-blocking functions.
+    (*conn->response.callback)(NULL, conn->response.callback_context); // Should do a cleanup, but no writes or flushes.
     free_remote_user(conn);
     close_connection(conn);
     mg_free(conn);
@@ -9164,7 +9162,7 @@ static void write_non_blocking(int epoll_fd, struct mg_connection *conn)
 #endif
 
 void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t size,
-                           void *callback_context, void (*callback)(void *, char))
+                           void *callback_context, void (*callback)(struct mg_connection *, void *))
 {
     if (conn == NULL) {
         return;
@@ -9172,9 +9170,6 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
 #if !defined(CIVET_NO_EPOLL)
     int epoll_fd = conn->ctx->epoll_fd;
     if (epoll_fd != -1) {
-        if (!conn->is_good) {
-            return; // It's a mistake to call this function after the connection has failed, so do nothing.
-        }
         set_non_blocking(&conn->client, 1);
         conn->response.buf = buf;
         conn->response.size = size;
@@ -9182,13 +9177,13 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
         conn->response.callback = callback;
         conn->response.callback_context = callback_context;
         conn->event_header.type = EPOLL_DATA_TYPE_WRITE_RESPONSE;
-        write_non_blocking(epoll_fd, conn);
+        write_non_blocking(epoll_fd, conn, true);
         return;
     }
 #endif
     // Emulate non-blocking behavior/outcome when the non-blocking functionality is not supported.
     mg_write(conn, buf, size);
-    (*callback)(callback_context, 1);
+    (*callback)(conn, callback_context);
 }
 
 void mg_flush_response_non_blocking(struct mg_connection *conn)
@@ -9198,9 +9193,6 @@ void mg_flush_response_non_blocking(struct mg_connection *conn)
     }
 #if !defined(CIVET_NO_EPOLL)
     if (conn->ctx->epoll_fd != -1) {
-        if (!conn->is_good) {
-            return; // It's a mistake to call this function after the connection has failed, so do nothing.
-        }
         complete_request(conn);
         return;
     }
@@ -9875,7 +9867,6 @@ static void accept_new_connection(const struct socket *listener,
 				if (epoll_fd != -1) {
                     conn->event_header.type = EPOLL_DATA_TYPE_READ_REQUEST;
                     conn->was_epoll_scheduled = false;
-                    conn->is_good = true;
                     if (schedule_for_epoll_op(epoll_fd, conn, EPOLLIN) != -1) {
                         return;
                     }
@@ -9944,11 +9935,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 			break;
 		}
         case EPOLL_DATA_TYPE_WRITE_RESPONSE: {
-            struct mg_connection *conn = event->data.ptr;
-            if (!(event->events & EPOLLOUT)) { // Note that if it's not EPOLLOUT, then it's EPOLLERR | EPOLLHUP
-                conn->is_good = false; // Connection is no longer viable because of the epoll errors
-            }
-            write_non_blocking(ctx->epoll_fd, conn);
+            write_non_blocking(ctx->epoll_fd, event->data.ptr, event->events & EPOLLOUT);
         }
 	}
 }
