@@ -7842,7 +7842,7 @@ static int deprecated_websocket_data_wrapper(
 #endif
 
 static void complete_request(struct mg_connection *conn);
-static void produce_socket(struct mg_context *ctx, struct mg_connection *cp);
+static void enqueue_connection(struct mg_context *ctx, struct mg_connection *cp);
 
 /* This is the heart of the Civetweb's logic.
  * This function is called when the request is read, parsed and validated,
@@ -9127,7 +9127,7 @@ static void complete_request(struct mg_connection *conn)
             }
         }
 #endif
-        produce_socket(conn->ctx, conn);
+        enqueue_connection(conn->ctx, conn);
         return;
     }
 destroy_connection:
@@ -9644,8 +9644,8 @@ static bool parse_request(struct mg_connection *conn)
     return false;
 }
 
-/* Worker threads take accepted socket from the queue */
-static int consume_socket(struct mg_context *ctx, struct mg_connection **cp)
+/* Worker threads take a connection from the queue */
+static int dequeue_connection(struct mg_context *ctx, struct mg_connection **cp)
 {
 #define QUEUE_SIZE(ctx) ((int)(ARRAY_SIZE(ctx->queue)))
 	if (!ctx) {
@@ -9701,10 +9701,9 @@ static void *worker_thread_run(void *thread_func_param)
 
 	pthread_setspecific(sTlsKey, &tls);
 
-	/* Call consume_socket() even when ctx->stop_flag > 0, to let it
-	 * signal sq_empty condvar to wake up the master waiting in
-	 * produce_socket() */
-	while (consume_socket(ctx, &conn)) {
+	/* Call dequeue_connection() even when ctx->stop_flag > 0, to let it
+	 * signal sq_empty condvar to wake up the master waiting in enqueue_connection() */
+	while (dequeue_connection(ctx, &conn)) {
 	    if (parse_request(conn)) {
 	        handle_request(conn);
 	    }
@@ -9742,8 +9741,8 @@ static void *worker_thread(void *thread_func_param)
 }
 #endif /* _WIN32 */
 
-/* Master thread adds accepted socket to a queue */
-static void produce_socket(struct mg_context *ctx, struct mg_connection *cp)
+/* Master and worker threads add a connection to the queue */
+static void enqueue_connection(struct mg_context *ctx, struct mg_connection *cp)
 {
 #define QUEUE_SIZE(ctx) ((int)(ARRAY_SIZE(ctx->queue)))
 	if (!ctx)
@@ -9884,7 +9883,7 @@ static void accept_new_connection(const struct socket *listener,
                     }
 				}
 #endif
-				produce_socket(ctx, conn);
+				enqueue_connection(ctx, conn);
 				return;
 			}
 			close_connection(conn);
@@ -9931,12 +9930,12 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 					conn->data_len = data_len;
 					if ((get_request_len(conn->buf, data_len) != 0) || (data_len == MAX_REQUEST_SIZE) || (n == 0)) {
 						// Both malformed (< 0) and completed (> 0) requests are processed in the worker thread
-						produce_socket(ctx, conn);
+						enqueue_connection(ctx, conn);
 					} else {
 						// Ask for more data as it comes in
 						if (schedule_event_for_epoll_op(ctx->epoll_fd, conn, EPOLLIN, event) == -1) {
 							// Failed to schedule, just let a worker handle it
-							produce_socket(ctx, conn);
+							enqueue_connection(ctx, conn);
 						}
 					}
 				}
