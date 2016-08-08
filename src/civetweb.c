@@ -1115,7 +1115,7 @@ struct mg_accept_socket {
 
 struct mg_context {
 	volatile int stop_flag;        /* Should we stop event loop */
-	volatile int live_sockets;     /* Combined number of listening sockets and accepted sockets that could result in new connections */
+	volatile int num_live_sockets; /* Combined number of listening sockets and accepted sockets that could result in new connections */
 	SSL_CTX *ssl_ctx;              /* SSL context */
 	char *config[NUM_OPTIONS];     /* Civetweb configuration parameters */
 	struct mg_callbacks callbacks; /* User-defined callback function */
@@ -8254,7 +8254,7 @@ static void close_all_listening_sockets(struct mg_context *ctx)
 		if (sock != INVALID_SOCKET) {
 			closesocket(sock);
 			ctx->listening_sockets[i].socket.sock = INVALID_SOCKET;
-			mg_atomic_dec(&ctx->live_sockets);
+			mg_atomic_dec(&ctx->num_live_sockets);
 		}
 	}
 }
@@ -8467,7 +8467,7 @@ static int set_ports_option(struct mg_context *ctx)
 				ctx->listening_ports[ctx->num_listening_sockets] =
 				    ntohs(usa.sin.sin_port);
 				ctx->num_listening_sockets++;
-				mg_atomic_inc(&ctx->live_sockets);
+				mg_atomic_inc(&ctx->num_live_sockets);
 			}
 		}
 
@@ -9009,7 +9009,7 @@ static void close_socket_gracefully(struct mg_connection *conn)
 
 	/* Now we know that our FIN is ACK-ed, safe to close */
 	closesocket(socket_fd);
-	mg_atomic_dec(&conn->ctx->live_sockets);
+	mg_atomic_dec(&conn->ctx->num_live_sockets);
 }
 
 static void close_connection(struct mg_connection *conn)
@@ -9660,7 +9660,7 @@ static bool dequeue_connection(struct mg_context *ctx, struct mg_connection **cp
         if (ctx->stop_flag == 1) { // No connection is available and stop was demanded, so let's try to stop
             (void)pthread_cond_signal(&ctx->sq_empty);
             (void)pthread_mutex_unlock(&ctx->thread_mutex);
-            if (ctx->live_sockets == 0) { // Now new connection could ever emerge, because all the sockets are closed.
+            if (ctx->num_live_sockets == 0) { // Now new connection could ever emerge, because all the sockets are closed.
                 return false; // There is no connection to process
             }
             // Oops, even though no connections are available, they could emerge later, because sockets are still open.
@@ -9857,7 +9857,7 @@ static void accept_new_connection(const struct socket *listener,
 				|| sslize(conn, conn->ctx->ssl_ctx, SSL_accept)
 #endif
 			   ) {
-				mg_atomic_inc(&ctx->live_sockets);
+				mg_atomic_inc(&ctx->num_live_sockets);
 #if !defined(CIVET_NO_EPOLL)
 				int epoll_fd = ctx->epoll_fd;
 				if (epoll_fd != -1) {
@@ -9895,7 +9895,7 @@ static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event
 				// Close file descriptors that have hung up or have an error
 				// Will be automatically removed from the epoll file descriptor
 				closesocket(close_event->socket);
-				mg_atomic_dec(&ctx->live_sockets);
+				mg_atomic_dec(&ctx->num_live_sockets);
 				mg_free(close_event);
 			}
 			break;
@@ -9948,7 +9948,7 @@ static void poll_for_connections(struct mg_context *ctx)
 	if (epoll_fd != -1) {
 		for (;;) {
 			count = epoll_wait(epoll_fd, events, sizeof(events) / sizeof(events[0]), 200);
-			if (ctx->live_sockets == 0) {
+			if (ctx->num_live_sockets == 0) {
 				break;
 			}
 			if (count == -1) {
