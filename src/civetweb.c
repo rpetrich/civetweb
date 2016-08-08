@@ -1115,7 +1115,7 @@ struct mg_accept_socket {
 
 struct mg_context {
 	volatile int stop_flag;        /* Should we stop event loop */
-	volatile int live_sockets;     /* How many sockets are being processed */
+	volatile int live_sockets;     /* Combined number of listening sockets and accepted sockets that could result in new connections */
 	SSL_CTX *ssl_ctx;              /* SSL context */
 	char *config[NUM_OPTIONS];     /* Civetweb configuration parameters */
 	struct mg_callbacks callbacks; /* User-defined callback function */
@@ -9635,44 +9635,42 @@ static bool parse_request(struct mg_connection *conn)
 }
 
 /* Worker threads take a connection from the queue */
-static int dequeue_connection(struct mg_context *ctx, struct mg_connection **cp)
+static bool dequeue_connection(struct mg_context *ctx, struct mg_connection **cp)
 {
 #define QUEUE_SIZE(ctx) ((int)(ARRAY_SIZE(ctx->queue)))
-	if (!ctx) {
-		*cp = NULL;
-		return 0;
-	}
-
 	(void)pthread_mutex_lock(&ctx->thread_mutex);
 	DEBUG_TRACE("%s", "going idle");
-
-	/* If the queue is empty, wait. We're idle at this point. */
-	while (ctx->sq_head == ctx->sq_tail && ctx->stop_flag == 0) {
-		pthread_cond_wait(&ctx->sq_full, &ctx->thread_mutex);
-	}
-
-	/* If we're stopping, sq_head may be equal to sq_tail. */
-	if (ctx->sq_head > ctx->sq_tail) {
-		/* Copy socket from the queue and increment tail */
-		*cp = ctx->queue[ctx->sq_tail % QUEUE_SIZE(ctx)];
-		ctx->sq_tail++;
-		if (cp) {
-			DEBUG_TRACE("grabbed socket %d, going busy", cp->client.sock);
-		}
-
-		/* Wrap pointers if needed */
-		while (ctx->sq_tail > QUEUE_SIZE(ctx)) {
-			ctx->sq_tail -= QUEUE_SIZE(ctx);
-			ctx->sq_head -= QUEUE_SIZE(ctx);
-		}
-	} else {
-		*cp = NULL;
-	}
-
-	(void)pthread_cond_signal(&ctx->sq_empty);
-	(void)pthread_mutex_unlock(&ctx->thread_mutex);
-
-	return ctx->live_sockets != 0;
+    for (;;) {
+        if (ctx->sq_head > ctx->sq_tail) { // There are connections available, so let's process them
+            /* Copy socket from the queue and increment tail */
+            *cp = ctx->queue[ctx->sq_tail % QUEUE_SIZE(ctx)];
+            ctx->sq_tail++;
+            if (cp) {
+                DEBUG_TRACE("grabbed socket %d, going busy", cp->client.sock);
+            }
+            /* Wrap pointers if needed */
+            while (ctx->sq_tail > QUEUE_SIZE(ctx)) {
+                ctx->sq_tail -= QUEUE_SIZE(ctx);
+                ctx->sq_head -= QUEUE_SIZE(ctx);
+            }
+            (void)pthread_cond_signal(&ctx->sq_empty);
+            (void)pthread_mutex_unlock(&ctx->thread_mutex);
+            return true; // There is a connection to process
+        }
+        if (ctx->stop_flag == 1) { // No connection is available and stop was demanded, so let's try to stop
+            (void)pthread_cond_signal(&ctx->sq_empty);
+            (void)pthread_mutex_unlock(&ctx->thread_mutex);
+            if (ctx->live_sockets == 0) { // Now new connection could ever emerge, because all the sockets are closed.
+                return false; // There is no connection to process
+            }
+            // Oops, even though no connections are available, they could emerge later, because sockets are still open.
+            // Let's wait for those potential connections.
+            usleep(1000);
+            (void)pthread_mutex_lock(&ctx->thread_mutex);
+            continue;
+        }
+        pthread_cond_wait(&ctx->sq_full, &ctx->thread_mutex); // Wait for new connections while stop is not required.
+    }
 #undef QUEUE_SIZE
 }
 
@@ -9735,8 +9733,6 @@ static void *worker_thread(void *thread_func_param)
 static void enqueue_connection(struct mg_context *ctx, struct mg_connection *cp)
 {
 #define QUEUE_SIZE(ctx) ((int)(ARRAY_SIZE(ctx->queue)))
-	if (!ctx)
-		return;
 	(void)pthread_mutex_lock(&ctx->thread_mutex);
 
 	/* If the queue is full, wait */
