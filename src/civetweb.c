@@ -1096,19 +1096,19 @@ enum {
     EPOLL_DATA_TYPE_READ_REQUEST,
     EPOLL_DATA_TYPE_WRITE_RESPONSE,
 };
-struct mg_epoll_event_header {
+struct epoll_event_header {
 	int type;
 };
-struct mg_epoll_event_accept_socket {
-	struct mg_epoll_event_header header;
+struct epoll_event_accept_socket {
+	struct epoll_event_header header;
 	struct socket socket;
 };
-struct mg_epoll_event_close_socket {
-	struct mg_epoll_event_header header;
+struct epoll_event_close_socket {
+	struct epoll_event_header header;
 	SOCKET socket;
 };
 #else
-struct mg_accept_socket {
+struct accept_socket {
 	struct socket socket;
 };
 #endif
@@ -1126,9 +1126,9 @@ struct mg_context {
 	double request_timeout; /* Request-level timeout from start to finish */
 
 #if !defined(CIVET_NO_EPOLL)
-	struct mg_epoll_event_accept_socket *listening_sockets;
+	struct epoll_event_accept_socket *listening_sockets;
 #else
-	struct mg_accept_socket *listening_sockets;
+	struct accept_socket *listening_sockets;
 #endif
 	in_port_t *listening_ports;
 	unsigned int num_listening_sockets;
@@ -1171,7 +1171,7 @@ struct mg_context {
 
 struct mg_connection {
 #if !defined(CIVET_NO_EPOLL)
-	struct mg_epoll_event_header event_header;
+	struct epoll_event_header event_header;
 	bool was_epoll_scheduled;
 #endif
 	struct mg_request_info request_info;
@@ -8362,9 +8362,9 @@ static int set_ports_option(struct mg_context *ctx)
 		struct vec vec;
 		struct socket so;
 #if !defined(CIVET_NO_EPOLL)
-		struct mg_epoll_event_accept_socket *ptr;
+		struct epoll_event_accept_socket *ptr;
 #else
-		struct mg_accept_socket *ptr;
+		struct accept_socket *ptr;
 #endif
 
 		in_port_t *portPtr;
@@ -8978,7 +8978,7 @@ static void close_socket_gracefully(struct mg_connection *conn)
 	if (err == 0 || errno != ENOTCONN) {
 	    int epoll_fd = conn->ctx->epoll_fd;
 	    if (epoll_fd != -1) {
-            struct mg_epoll_event_close_socket *data = mg_calloc(sizeof(*data), 1);
+            struct epoll_event_close_socket *data = mg_calloc(sizeof(*data), 1);
             if (data) {
                 data->header.type = EPOLL_DATA_TYPE_CLOSE_SOCKET;
                 data->socket = socket_fd;
@@ -9880,17 +9880,17 @@ static void accept_new_connection(const struct socket *listener,
 #if !defined(CIVET_NO_EPOLL)
 static void handle_epoll_event(struct mg_context *ctx, struct epoll_event *event)
 {
-	struct mg_epoll_event_header *header = event->data.ptr;
+	struct epoll_event_header *header = event->data.ptr;
 	switch (header->type) {
 		case EPOLL_DATA_TYPE_ACCEPT_SOCKET: {
-			struct mg_epoll_event_accept_socket *accept_event = event->data.ptr;
+			struct epoll_event_accept_socket *accept_event = event->data.ptr;
 			if (event->events & EPOLLIN) {
 				accept_new_connection(&accept_event->socket, ctx);
 			}
 			break;
 		}
 		case EPOLL_DATA_TYPE_CLOSE_SOCKET: {
-			struct mg_epoll_event_close_socket *close_event = event->data.ptr;
+			struct epoll_event_close_socket *close_event = event->data.ptr;
 			if (event->events & (EPOLLERR | EPOLLHUP)) {
 				// Close file descriptors that have hung up or have an error
 				// Will be automatically removed from the epoll file descriptor
