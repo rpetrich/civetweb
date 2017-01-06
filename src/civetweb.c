@@ -8511,7 +8511,7 @@ static void log_access(const struct mg_connection *conn)
 	         ? NULL
 	         : fopen(conn->ctx->config[ACCESS_LOG_FILE], "a+");
 
-	if (fp == NULL && conn->ctx->callbacks.log_message == NULL)
+	if (fp == NULL && conn->ctx->callbacks.log_access == NULL)
 		return;
 
 	tm = localtime(&conn->conn_birth_time);
@@ -8542,8 +8542,8 @@ static void log_access(const struct mg_connection *conn)
 	         referer,
 	         user_agent);
 
-	if (conn->ctx->callbacks.log_access) {
-		conn->ctx->callbacks.log_access(conn, buf);
+	if (conn->ctx->callbacks.log_access && conn->ctx->callbacks.log_access(conn, buf)) {
+	    return;
 	}
 
 	if (fp) {
