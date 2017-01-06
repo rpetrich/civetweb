@@ -9186,6 +9186,53 @@ void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t s
     (*callback)(conn, callback_context);
 }
 
+typedef struct mg_writev_emulation_state {
+    void *original_context;
+    void (*original_callback)(struct mg_connection *conn, void *);
+    int current_index;
+    int buffer_count;
+    struct iovec buffers[];
+} mg_writev_emulation_state;
+
+static void mg_writev_non_blocking_continuation(struct mg_connection* connection, void* context);
+
+void mg_writev_non_blocking(struct mg_connection *conn, struct iovec *buffers, int buffer_count,
+                            void *callback_context, void (*callback)(struct mg_connection *conn, void *))
+{
+    if (conn == NULL) {
+        return;
+    }
+    if (buffer_count <= 0) {
+        (*callback)(conn, callback_context);
+    } else if (buffer_count == 1) {
+        // Simple case of a single buffer, no need to allocate any additional state
+        mg_write_non_blocking(conn, buffers[0].iov_base, buffers[0].iov_len, callback_context, callback);
+    } else {
+        // Emulate scattered writes by repeatedly calling mg_write_non_blocking
+        mg_writev_emulation_state *state = mg_malloc(sizeof(mg_writev_emulation_state) + sizeof(*buffers) * buffer_count);
+        state->original_context = callback_context;
+        state->original_callback = callback;
+        state->current_index = 0;
+        state->buffer_count = buffer_count;
+        memcpy(&state->buffers[0], buffers, sizeof(*buffers) * buffer_count);
+        mg_write_non_blocking(conn, buffers[0].iov_base, buffers[0].iov_len, state, mg_writev_non_blocking_continuation);
+    }
+}
+
+static void mg_writev_non_blocking_continuation(struct mg_connection* conn, void* context)
+{
+    mg_writev_emulation_state *state = (mg_writev_emulation_state *)context;
+    if (++state->current_index < state->buffer_count) {
+        struct iovec *buffer = &state->buffers[state->current_index];
+        mg_write_non_blocking(conn, buffer->iov_base, buffer->iov_len, state, mg_writev_non_blocking_continuation);
+    } else {
+        void *callback_context = state->original_context;
+        void (*callback)(struct mg_connection *conn, void *) = state->original_callback;
+        mg_free(state);
+        callback(conn, callback_context);
+    }
+}
+
 void mg_flush_response_non_blocking(struct mg_connection *conn)
 {
     if (conn == NULL) {

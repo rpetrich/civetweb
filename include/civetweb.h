@@ -41,6 +41,7 @@
 
 #include <stdio.h>
 #include <stddef.h>
+#include <sys/uio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -406,9 +407,12 @@ CIVETWEB_API int mg_write(struct mg_connection *, const void *buf, size_t len);
 /* Flush data to the client, potentially closes the connection if keep alive isn't supported */
 CIVETWEB_API void mg_flush_response(struct mg_connection *);
 
-/* Send data to the client asynchronously. This function can be called directly on;y once per response. All additional
+/* Send data to the client asynchronously. This function can be called directly only once per response. All additional
    calls, if necessary, must be done from the callback. */
 CIVETWEB_API void mg_write_non_blocking(struct mg_connection *conn, const void *buf, size_t size,
+                                        void *callback_context, void (*callback)(struct mg_connection *conn, void *));
+
+CIVETWEB_API void mg_writev_non_blocking(struct mg_connection *conn, struct iovec *buffers, int buffer_count,
                                         void *callback_context, void (*callback)(struct mg_connection *conn, void *));
 
 /* Flush data provided by the mg_write_non_blocking call(s) to the client, potentially closes the connection if keep
